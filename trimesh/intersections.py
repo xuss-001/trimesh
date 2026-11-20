@@ -667,6 +667,7 @@ def slice_mesh_plane(
     plane_origin,
     face_index=None,
     cap=False,
+    cap_color=None,
     engine=None,
     **kwargs,
 ):
@@ -685,6 +686,12 @@ def slice_mesh_plane(
       Point on plane to intersect with mesh
     cap : bool
       If True, cap the result with a triangulated polygon
+    cap_color : None or str or (3|4,) uint8
+      Solid color assigned to the cap faces. Accepts RGB(A) arrays,
+      0-1 float colors or hex strings. When the source mesh is
+      textured the original surface keeps its UV mapping and material
+      while the cap faces carry this face color. Has no effect when
+      ``cap`` is False.
     face_index : ((m,) int)
       Indexes of mesh.faces to slice. When no mask is provided, the
       default is to slice all faces.
@@ -711,7 +718,7 @@ def slice_mesh_plane(
     from .base import Trimesh
     from .creation import triangulate_polygon
     from .path import polygons
-    from .visual import TextureVisuals
+    from .visual import DEFAULT_COLOR, TextureVisuals, to_rgba
 
     # check input plane
     plane_normal = np.asanyarray(plane_normal, dtype=np.float64)
@@ -730,11 +737,25 @@ def slice_mesh_plane(
     vertices = mesh.vertices.copy()
     faces = mesh.faces.copy()
 
-    # We copy the UV coordinates if available
-    has_uv = (
-        hasattr(mesh.visual, "uv") and np.shape(mesh.visual.uv) == (len(mesh.vertices), 2)
-    ) and not cap
+    # copy the UV coordinates when the source mesh carries a texture so
+    # the sliced surface keeps its material and texture placement, even
+    # when capping is requested
+    has_uv = hasattr(mesh.visual, "uv") and np.shape(mesh.visual.uv) == (
+        len(mesh.vertices),
+        2,
+    )
     uv = mesh.visual.uv.copy() if has_uv else None
+
+    # remember every slicing plane so cap faces can be identified once
+    # all of the planes have been applied
+    cap_planes = []
+    if cap and cap_color is not None:
+        if isinstance(cap_color, str):
+            from .visual.color import hex_to_rgba
+
+            cap_color = hex_to_rgba(cap_color)
+        else:
+            cap_color = to_rgba(cap_color)
 
     if "process" not in kwargs:
         kwargs["process"] = False
@@ -743,6 +764,10 @@ def slice_mesh_plane(
     for origin, normal in zip(
         plane_origin.reshape((-1, 3)), plane_normal.reshape((-1, 3))
     ):
+        origin = np.asarray(origin, dtype=np.float64)
+        normal = np.asarray(normal, dtype=np.float64)
+        if cap:
+            cap_planes.append((origin, normal))
         # save the new vertices and faces
         vertices, faces, uv = slice_faces_plane(
             vertices=vertices,
@@ -761,6 +786,9 @@ def slice_mesh_plane(
             # start by deduplicating vertices again
             unique, inverse = grouping.unique_rows(vertices)
             vertices = vertices[unique]
+            # keep the UV table aligned with the deduplicated vertices
+            if uv is not None:
+                uv = uv[unique]
             # will collect additional faces
             f = inverse[faces]
             # remove degenerate faces by checking to make sure
@@ -801,9 +829,33 @@ def slice_mesh_plane(
 
             faces = np.vstack(faces)
 
-    visual = (
-        TextureVisuals(uv=uv, material=mesh.visual.material.copy()) if has_uv else None
-    )
+    visual = None
+    face_colors = None
+    if has_uv:
+        visual = TextureVisuals(uv=uv, material=mesh.visual.material.copy())
+
+    if cap and cap_color is not None and len(faces) > 0:
+        # mark faces whose three vertices lie on one of the slicing
+        # planes: these are cap faces
+        is_cap = np.zeros(len(faces), dtype=bool)
+        for origin, normal in cap_planes:
+            dots = np.abs(np.dot(vertices - origin, normal))
+            is_cap |= (dots[faces] < 1e-8).all(axis=1)
+        face_colors = np.tile(cap_color, (len(faces), 1)).astype(np.uint8)
+        # original surface faces keep the default (uncolored) marker so
+        # they remain visually distinct from the solid-colored caps
+        face_colors[~is_cap] = DEFAULT_COLOR
+
+        if not has_uv:
+            # plain face colors are consumed directly by the Trimesh
+            # constructor when no texture visual is supplied
+            visual = None
 
     # return the sliced mesh
-    return Trimesh(vertices=vertices, faces=faces, visual=visual, **kwargs)
+    return Trimesh(
+        vertices=vertices,
+        faces=faces,
+        visual=visual,
+        face_colors=face_colors,
+        **kwargs,
+    )
