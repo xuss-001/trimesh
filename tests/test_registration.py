@@ -196,6 +196,125 @@ class RegistrationTest(g.unittest.TestCase):
         assert g.np.allclose(matrix, g.np.linalg.inv(matrixN))
         assert g.np.allclose(transformed, points_a[index])
 
+    def test_icp_filter_partial_overlap_outliers(self):
+        # ICP with correspondence filtering should be robust to
+        # partially overlapping scans containing outliers
+        rng = g.np.random.default_rng(seed=0)
+
+        # source cloud in a unit cube
+        points_a = rng.random((400, 3))
+        # a small transform recoverable from an identity initial guess
+        matrix = g.trimesh.transformations.rotation_matrix(
+            g.np.radians(2.0), [0, 0, 1]
+        )
+        matrix[:3, 3] = [0.02, -0.01, 0.01]
+
+        # target: only 70% of the source points have a true match
+        inliers = g.trimesh.transform_points(points_a[:280], matrix)
+        # add outliers far away from the overlap region
+        outliers = rng.random((40, 3)) * 10 + 20
+        points_b = g.np.vstack((inliers, outliers))
+
+        # the registration must not modify its inputs
+        a_original = points_a.copy()
+        b_original = points_b.copy()
+
+        matrixN, transformed, cost = g.trimesh.registration.icp(
+            points_a,
+            points_b,
+            scale=False,
+            max_correspondence_distance=0.5,
+            keep_ratio=0.7,
+        )
+
+        assert g.np.allclose(points_a, a_original)
+        assert g.np.allclose(points_b, b_original)
+
+        # the recovered transform should be close to the true one
+        assert g.np.allclose(matrixN, matrix, atol=1e-6)
+        # the returned transform is applied to all source points
+        assert transformed.shape == points_a.shape
+        assert g.np.allclose(
+            transformed, g.trimesh.transform_points(points_a, matrixN)
+        )
+        # cost is the mean squared distance of the kept correspondences
+        assert cost < 1e-10
+
+        # without filtering the outliers should degrade the result
+        matrixU, _transformedU, costU = g.trimesh.registration.icp(
+            points_a, points_b, scale=False
+        )
+        error_filtered = g.np.abs(matrixN - matrix).max()
+        error_unfiltered = g.np.abs(matrixU - matrix).max()
+        assert error_filtered < error_unfiltered
+        assert costU > cost
+
+    def test_icp_filter_order(self):
+        # `max_correspondence_distance` is applied first and
+        # `keep_ratio` then keeps a rounded-up fraction of the
+        # closest *remaining* correspondences
+        a = g.np.array(
+            [[float(i), 0.3 * (i % 2), 0.0] for i in range(10)]
+        )
+        # offset targets so nearest-neighbor distances are known
+        offsets = 0.05 * g.np.arange(1, 11)
+        b = a + g.np.column_stack(
+            (g.np.zeros(10), offsets, g.np.zeros(10))
+        )
+
+        # distances are [0.05 .. 0.50]: the distance limit keeps the
+        # first 6 and the ratio then keeps ceil(0.5 * 6) == 3 of them
+        matrixN, transformed, cost = g.trimesh.registration.icp(
+            a,
+            b,
+            scale=False,
+            max_iterations=1,
+            max_correspondence_distance=0.32,
+            keep_ratio=0.5,
+        )
+
+        # the expected result is a procrustes solve on exactly the
+        # three closest in-limit correspondences
+        matrixE, transformedE, costE = g.trimesh.registration.procrustes(
+            a=a[:3], b=b[:3], scale=False
+        )
+        assert g.np.allclose(matrixN, matrixE)
+        assert g.np.isclose(cost, costE)
+        # all points are transformed even though three were used
+        assert g.np.allclose(transformed, g.trimesh.transform_points(a, matrixN))
+        assert g.np.allclose(transformed[:3], transformedE)
+
+        # keeping everything should match the unfiltered behavior
+        m1, t1, c1 = g.trimesh.registration.icp(a, b, scale=False)
+        m2, t2, c2 = g.trimesh.registration.icp(a, b, scale=False, keep_ratio=1.0)
+        assert g.np.allclose(m1, m2)
+        assert g.np.allclose(t1, t2)
+        assert g.np.isclose(c1, c2)
+
+    def test_icp_filter_invalid(self):
+        # invalid filtering parameters should raise
+        rng = g.np.random.default_rng(seed=0)
+        a = rng.random((10, 3))
+        b = rng.random((10, 3))
+        icp = g.trimesh.registration.icp
+
+        with g.pytest.raises(ValueError):
+            icp(a, b, max_correspondence_distance=-1.0)
+        with g.pytest.raises(ValueError):
+            icp(a, b, max_correspondence_distance=0.0)
+        with g.pytest.raises(ValueError):
+            icp(a, b, max_correspondence_distance=g.np.inf)
+        with g.pytest.raises(ValueError):
+            icp(a, b, keep_ratio=0.0)
+        with g.pytest.raises(ValueError):
+            icp(a, b, keep_ratio=1.5)
+        with g.pytest.raises(ValueError):
+            icp(a, b, keep_ratio=g.np.nan)
+
+        # too few correspondences survive the filtering
+        with g.pytest.raises(ValueError):
+            icp(a, b, max_correspondence_distance=1e-12)
+
     def test_mesh(self):
         noise = 0.05
         extents = [6, 12, 3]

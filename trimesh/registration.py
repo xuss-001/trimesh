@@ -332,7 +332,16 @@ def procrustes(
     return matrix
 
 
-def icp(a, b, initial=None, threshold=1e-5, max_iterations=20, **kwargs):
+def icp(
+    a,
+    b,
+    initial=None,
+    threshold=1e-5,
+    max_iterations=20,
+    max_correspondence_distance=None,
+    keep_ratio=None,
+    **kwargs,
+):
     """
     Apply the iterative closest point algorithm to align a point cloud with
     another point cloud or mesh. Will only produce reasonable results if the
@@ -352,6 +361,14 @@ def icp(a, b, initial=None, threshold=1e-5, max_iterations=20, **kwargs):
       Stop when change in cost is less than threshold
     max_iterations : int
       Maximum number of iterations
+    max_correspondence_distance : None or float
+      If specified, discard correspondences whose distance to the
+      closest point exceeds this value before solving each iteration.
+      Useful for partially overlapping scans and outliers.
+    keep_ratio : None or float in (0, 1]
+      If specified, after discarding far correspondences keep only
+      this fraction of the closest remaining correspondences
+      (rounded up) when solving each iteration.
     kwargs : dict
       Args to pass to procrustes
 
@@ -362,12 +379,32 @@ def icp(a, b, initial=None, threshold=1e-5, max_iterations=20, **kwargs):
     transformed : (n,3) float
       The image of a under the transformation
     cost : float
-      The cost of the transformation
+      The mean squared distance of the correspondences used in
+      the final iteration after applying its update
     """
 
     a = np.asanyarray(a, dtype=np.float64)
     if not util.is_shape(a, (-1, 3)):
         raise ValueError("points must be (n,3)!")
+
+    if max_correspondence_distance is not None:
+        max_correspondence_distance = float(max_correspondence_distance)
+        if not np.isfinite(max_correspondence_distance) or (
+            max_correspondence_distance <= 0.0
+        ):
+            raise ValueError(
+                "max_correspondence_distance must be a positive finite value!"
+            )
+    if keep_ratio is not None:
+        keep_ratio = float(keep_ratio)
+        if not np.isfinite(keep_ratio) or keep_ratio <= 0.0 or keep_ratio > 1.0:
+            raise ValueError("keep_ratio must be in the interval (0, 1]!")
+
+    filter_correspondences = (
+        max_correspondence_distance is not None or keep_ratio is not None
+    )
+    if filter_correspondences and kwargs.get("weights") is not None:
+        raise ValueError("weights cannot be combined with correspondence filtering!")
 
     if initial is None:
         initial = np.eye(4)
@@ -390,16 +427,40 @@ def icp(a, b, initial=None, threshold=1e-5, max_iterations=20, **kwargs):
     for _ in range(max_iterations):
         # Closest point in b to each point in a
         if is_mesh:
-            closest, _distance, _faces = b.nearest.on_surface(a)
+            closest, distance, _faces = b.nearest.on_surface(a)
         else:
-            _distances, ix = btree.query(a, 1)
+            distance, ix = btree.query(a, 1)
             closest = b[ix]
 
-        # align a with closest points
-        matrix, transformed, cost = procrustes(a=a, b=closest, **kwargs)
+        if filter_correspondences:
+            # first discard correspondences beyond the distance limit
+            if max_correspondence_distance is not None:
+                valid = distance <= max_correspondence_distance
+            else:
+                valid = np.ones(len(a), dtype=bool)
+            # then keep the requested fraction of the closest remaining
+            if keep_ratio is not None:
+                index = np.nonzero(valid)[0]
+                count = int(np.ceil(keep_ratio * len(index)))
+                index = index[np.argsort(distance[index], kind="stable")[:count]]
+                valid = np.zeros(len(a), dtype=bool)
+                valid[index] = True
+            if valid.sum() < 3:
+                raise ValueError(
+                    "fewer than 3 correspondences remain after filtering, "
+                    "cannot solve for a 3D transform: try raising "
+                    "`max_correspondence_distance` or `keep_ratio`!"
+                )
+            # solve using only the kept correspondences
+            matrix, _transformed, cost = procrustes(
+                a=a[valid], b=closest[valid], **kwargs
+            )
+            # apply the resulting transform to all points
+            a = transform_points(a, matrix)
+        else:
+            # align a with closest points
+            matrix, a, cost = procrustes(a=a, b=closest, **kwargs)
 
-        # update a with our new transformed points
-        a = transformed
         total_matrix = np.dot(matrix, total_matrix)
 
         if old_cost - cost < threshold:
@@ -407,7 +468,7 @@ def icp(a, b, initial=None, threshold=1e-5, max_iterations=20, **kwargs):
         else:
             old_cost = cost
 
-    return total_matrix, transformed, cost
+    return total_matrix, a, cost
 
 
 def _normalize_by_source(source_mesh, target_geometry, target_positions):
