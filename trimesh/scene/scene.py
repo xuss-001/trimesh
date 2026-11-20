@@ -1020,6 +1020,121 @@ class Scene(Geometry3D):
         result = Scene(geometry=geometry, graph=graph)
         return result
 
+    def select(self, nodes: Hashable | Sequence[Hashable]) -> "Scene":
+        """
+        Select one or more nodes and return them as a new scene
+        positioned in the same world frame.
+
+        The result contains every selected node together with all of
+        their descendants, keeping the parent-child relationships that
+        fall inside the selection. Transforms contributed by ancestors
+        that are not selected are baked into the root edges so the
+        extracted parts keep their original world coordinates.
+
+        Geometry shared by multiple instances stays shared, and
+        selecting a parent together with one of its children or
+        repeating a node does not duplicate anything. The returned
+        meshes, materials and transforms are independent copies, so
+        editing the result never affects the original scene.
+
+        Parameters
+        ------------
+        nodes
+          A single node name or a sequence of node names in
+          `self.graph`. An empty selection returns an empty scene.
+
+        Returns
+        -----------
+        selected
+          A new scene holding the selected subtrees in world space.
+
+        Raises
+        -----------
+        ValueError
+          If any of the requested nodes is not in `self.graph`.
+        """
+        graph = self.graph
+        base_frame = graph.base_frame
+
+        # a single hashable node is accepted as-is; strings are
+        # sequences of characters so exclude them explicitly
+        if isinstance(nodes, str) or not util.is_sequence(nodes):
+            nodes = [nodes]
+
+        # remove repeated selections while keeping the order stable
+        requested = list(dict.fromkeys(nodes))
+
+        # an empty selection is a valid empty scene
+        if len(requested) == 0:
+            return Scene(
+                base_frame=base_frame,
+                metadata=deepcopy(self.metadata),
+            )
+
+        # every requested node must exist in the scene graph
+        invalid = [node for node in requested if node not in graph]
+        if len(invalid) > 0:
+            raise ValueError(
+                "node(s) not found in scene graph: "
+                + ", ".join(str(node) for node in invalid)
+            )
+
+        # expand every selection into itself plus all of its descendants
+        kept = set()
+        for node in requested:
+            kept.update(graph.transforms.successors(node))
+
+        # iterate parent->child edges: a kept child whose parent is not
+        # kept becomes a root hanging off the base frame
+        parents = graph.transforms.parents
+
+        result_graph = SceneGraph(base_frame=base_frame)
+        edge_data = graph.transforms.edge_data
+
+        for child, parent in parents.items():
+            if child not in kept:
+                continue
+            if parent in kept:
+                # preserve the original local parent-child edge
+                frame_from = parent
+                props = edge_data[(parent, child)]
+                matrix = props["matrix"].copy()
+            else:
+                # the unselected ancestor chain is collapsed into a
+                # single world-space transform for the new root
+                frame_from = base_frame
+                matrix, _ = graph.get(child, base_frame)
+                matrix = matrix.copy()
+
+            update_kwargs = {
+                "frame_from": frame_from,
+                "frame_to": child,
+                "matrix": matrix,
+            }
+            edge_metadata = edge_data[(parent, child)].get("metadata")
+            if edge_metadata is not None:
+                update_kwargs["metadata"] = deepcopy(edge_metadata)
+            if "geometry" in graph.transforms.node_data[child]:
+                update_kwargs["geometry"] = graph.transforms.node_data[child][
+                    "geometry"
+                ]
+            result_graph.update(**update_kwargs)
+
+        # copy each referenced geometry once so shared instances keep
+        # sharing one mesh while the copies stay fully independent
+        geometry_names = {
+            attr["geometry"]
+            for attr in result_graph.transforms.node_data.values()
+            if "geometry" in attr and attr["geometry"] in self.geometry
+        }
+        geometry = {name: self.geometry[name].copy() for name in geometry_names}
+
+        return Scene(
+            geometry=geometry,
+            graph=result_graph,
+            metadata=deepcopy(self.metadata),
+        )
+
     @caching.cache_decorator
     def convex_hull(self):
         """

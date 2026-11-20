@@ -635,6 +635,285 @@ def test_center_mass_no_massive_geometry():
         _ = scene.center_mass
 
 
+def _select_scene():
+    # build a scene with nested (translation + rotation + translation)
+    # transforms, two different meshes and a shared mesh instance:
+    #
+    # world
+    #   group (translate)
+    #     inner (rotate)
+    #       leaf_mesh  (translate, geometry "shared")
+    #     sibling_mesh (translate, geometry "other")
+    #   shared_instance (translate, geometry "shared")
+    scene = g.trimesh.Scene()
+
+    shared = g.trimesh.creation.box(extents=[1, 1, 1])
+    other = g.trimesh.creation.icosphere(subdivisions=2, radius=0.5)
+
+    scene.add_geometry(
+        shared,
+        geom_name="shared",
+        node_name="leaf_mesh",
+        parent_node_name="inner",
+        transform=g.trimesh.transformations.translation_matrix([0, 0, 5]),
+    )
+    scene.add_geometry(
+        other,
+        geom_name="other",
+        node_name="sibling_mesh",
+        parent_node_name="group",
+        transform=g.trimesh.transformations.translation_matrix([5, 0, 0]),
+    )
+    scene.graph.update(
+        frame_to="inner",
+        frame_from="group",
+        matrix=g.trimesh.transformations.rotation_matrix(0.7, [0, 1, 0]),
+    )
+    scene.graph.update(
+        frame_to="group",
+        frame_from="world",
+        matrix=g.trimesh.transformations.translation_matrix([1, 2, 3]),
+    )
+    scene.graph.update(
+        frame_to="shared_instance",
+        frame_from="world",
+        geometry="shared",
+        matrix=g.trimesh.transformations.translation_matrix([10, 0, 0]),
+    )
+    return scene
+
+
+def test_select_nested_transforms_preserve_world_position():
+    scene = _select_scene()
+
+    # select an inner node whose ancestors are not selected: the
+    # ancestor transforms must be baked into the new root edge
+    sub = scene.select(["inner"])
+
+    # parent-child relationships inside the selection are retained
+    assert set(sub.graph.nodes) == {"world", "inner", "leaf_mesh"}
+    assert sub.graph.transforms.parents["leaf_mesh"] == "inner"
+    # "inner" becomes a root node hanging off the base frame
+    assert sub.graph.transforms.parents["inner"] == "world"
+
+    # the local edge below the root is untouched
+    assert g.np.allclose(
+        sub.graph.transforms.edge_data[("inner", "leaf_mesh")]["matrix"],
+        scene.graph.transforms.edge_data[("inner", "leaf_mesh")]["matrix"],
+    )
+
+    # world coordinates are identical for every retained geometry node
+    for node in sub.graph.nodes_geometry:
+        original_transform = scene.graph.get(node)[0]
+        selected_transform = sub.graph.get(node)[0]
+        g.np.testing.assert_allclose(selected_transform, original_transform)
+
+    # the baked root transform places the mesh at the same world bounds
+    transformed = g.trimesh.transform_points(
+        scene.geometry["shared"].vertices, scene.graph.get("leaf_mesh")[0]
+    )
+    g.np.testing.assert_allclose(
+        sub.bounds,
+        g.np.array([transformed.min(axis=0), transformed.max(axis=0)]),
+        atol=1e-8,
+    )
+
+
+def test_select_multi_nodes_and_deduplication():
+    scene = _select_scene()
+
+    # select a parent together with its child and a separate instance
+    sub = scene.select(["group", "inner", "shared_instance"])
+
+    # descendants are included once, parent-child structure retained
+    assert set(sub.graph.nodes) == {
+        "world",
+        "group",
+        "inner",
+        "leaf_mesh",
+        "sibling_mesh",
+        "shared_instance",
+    }
+    assert sub.graph.transforms.parents["inner"] == "group"
+    assert sub.graph.transforms.parents["leaf_mesh"] == "inner"
+
+    # the shared mesh is still referenced by both instances
+    assert set(sub.geometry.keys()) == {"shared", "other"}
+    assert set(sub.graph.geometry_nodes["shared"]) == {
+        "leaf_mesh",
+        "shared_instance",
+    }
+    assert len(sub.graph.nodes_geometry) == 3
+
+    # repeating the same node must not duplicate anything
+    repeated = scene.select(["group", "group", "inner", "inner"])
+    assert set(repeated.graph.nodes) == {
+        "world",
+        "group",
+        "inner",
+        "leaf_mesh",
+        "sibling_mesh",
+    }
+    assert len(repeated.graph.nodes_geometry) == 2
+
+    # a single (non-sequence) node is also accepted
+    single = scene.select("inner")
+    assert set(single.graph.nodes) == {"world", "inner", "leaf_mesh"}
+
+    # every retained node keeps its original world pose
+    for node in sub.graph.nodes_geometry:
+        g.np.testing.assert_allclose(
+            sub.graph.get(node)[0], scene.graph.get(node)[0]
+        )
+
+
+def test_select_empty_and_invalid_nodes():
+    scene = _select_scene()
+
+    # an empty selection returns an empty scene
+    empty = scene.select([])
+    assert empty.is_empty
+    assert len(empty.graph.nodes_geometry) == 0
+    assert empty.graph.base_frame == scene.graph.base_frame
+
+    # invalid nodes raise and explain which node was rejected
+    with g.pytest.raises(ValueError, match="does_not_exist"):
+        scene.select(["group", "does_not_exist"])
+
+    # a wholly invalid selection never returns a partial scene
+    with g.pytest.raises(ValueError):
+        scene.select(["nope"])
+
+
+def test_select_is_independent_copy():
+    scene = _select_scene()
+    original_vertices = scene.geometry["shared"].vertices.copy()
+    original_edge = scene.graph.transforms.edge_data[
+        ("inner", "leaf_mesh")
+    ]["matrix"].copy()
+
+    sub = scene.select(["group", "shared_instance"])
+
+    # geometry objects are independent copies, including shared ones
+    assert sub.geometry["shared"] is not scene.geometry["shared"]
+    assert sub.geometry["other"] is not scene.geometry["other"]
+    # but the two instances still share the single copied mesh object
+    shared_nodes = sub.graph.geometry_nodes["shared"]
+    assert set(shared_nodes) == {"leaf_mesh", "shared_instance"}
+
+    # editing the extracted mesh does not touch the original
+    sub.geometry["shared"].apply_translation([100.0, 100.0, 100.0])
+    g.np.testing.assert_allclose(
+        scene.geometry["shared"].vertices, original_vertices
+    )
+
+    # editing an extracted transform does not touch the original
+    sub.graph.transforms.edge_data[("inner", "leaf_mesh")]["matrix"][:3, 3] += 50
+    g.np.testing.assert_allclose(
+        scene.graph.transforms.edge_data[("inner", "leaf_mesh")]["matrix"],
+        original_edge,
+    )
+
+    # material instances are copied as well
+    assert (
+        sub.geometry["shared"].visual is not scene.geometry["shared"].visual
+    )
+
+
+def test_select_glb_roundtrip_poses_and_materials():
+    from trimesh.visual.material import PBRMaterial
+    from trimesh.visual.texture import TextureVisuals
+
+    red = PBRMaterial(
+        name="red",
+        baseColorFactor=(255, 0, 0, 255),
+        metallicFactor=0.1,
+        roughnessFactor=0.8,
+    )
+    blue = PBRMaterial(
+        name="blue",
+        baseColorFactor=(0, 0, 255, 255),
+        metallicFactor=0.5,
+        roughnessFactor=0.4,
+    )
+
+    red_mesh = g.trimesh.creation.box(extents=[1, 1, 1])
+    red_mesh.visual = TextureVisuals(
+        material=red, uv=g.np.zeros((len(red_mesh.vertices), 2))
+    )
+    blue_mesh = g.trimesh.creation.box(extents=[2, 2, 2])
+    blue_mesh.visual = TextureVisuals(
+        material=blue, uv=g.np.zeros((len(blue_mesh.vertices), 2))
+    )
+
+    scene = g.trimesh.Scene()
+    scene.add_geometry(
+        red_mesh,
+        geom_name="redbox",
+        node_name="red_node",
+        parent_node_name="group",
+        transform=g.trimesh.transformations.translation_matrix([0, 0, 3]),
+    )
+    scene.add_geometry(
+        blue_mesh,
+        geom_name="bluebox",
+        node_name="blue_node",
+        parent_node_name="group",
+        transform=g.trimesh.transformations.translation_matrix([5, 0, 0]),
+    )
+    scene.graph.update(
+        frame_to="group",
+        frame_from="world",
+        matrix=g.trimesh.transformations.translation_matrix([1, 2, 0]),
+    )
+    scene.graph.update(
+        frame_to="red_instance",
+        frame_from="world",
+        geometry="redbox",
+        matrix=g.trimesh.transformations.translation_matrix([0, 10, 0]),
+    )
+
+    sub = scene.select(["group", "red_instance"])
+
+    with g.TemporaryDirectory() as directory:
+        path = g.os.path.join(directory, "selected.glb")
+        sub.export(path)
+        reloaded = g.trimesh.load(path, force="scene")
+
+    # geometry and node names survive the round trip
+    assert set(reloaded.geometry.keys()) == {"redbox", "bluebox"}
+    assert set(reloaded.graph.nodes_geometry) == set(
+        sub.graph.nodes_geometry
+    )
+
+    # every node keeps the same world-space pose after reloading
+    for node in sub.graph.nodes_geometry:
+        g.np.testing.assert_allclose(
+            reloaded.graph.get(node)[0], sub.graph.get(node)[0], atol=1e-6
+        )
+
+    # world-space bounds are preserved through export and reload
+    g.np.testing.assert_allclose(reloaded.bounds, sub.bounds, atol=1e-6)
+
+    # materials and their PBR parameters survive the round trip
+    for name, mesh in sub.geometry.items():
+        reloaded_material = reloaded.geometry[name].visual.material
+        original_material = mesh.visual.material
+        assert isinstance(reloaded_material, PBRMaterial)
+        g.np.testing.assert_allclose(
+            reloaded_material.baseColorFactor,
+            original_material.baseColorFactor,
+        )
+        g.np.testing.assert_allclose(
+            reloaded_material.metallicFactor,
+            original_material.metallicFactor,
+        )
+        g.np.testing.assert_allclose(
+            reloaded_material.roughnessFactor,
+            original_material.roughnessFactor,
+        )
+
+
 if __name__ == "__main__":
     g.trimesh.util.attach_to_log()
     test_empty()
