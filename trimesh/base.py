@@ -2236,6 +2236,62 @@ class Trimesh(Geometry3D):
 
         return result
 
+    def subdivide_to_size_selected(
+        self,
+        face_index: ArrayLike,
+        max_edge: Number,
+        max_iter: Integer = 10,
+        return_index: bool = False,
+    ) -> "Trimesh | tuple[Trimesh, NDArray[int64]]":
+        """
+        Subdivide a selection of faces until every edge in the
+        selection is shorter than a specified length.
+
+        Only the selected region is refined; neighboring faces are
+        subdivided just enough to keep shared edges conforming, so
+        the mesh stays watertight without introducing cracks. Faces
+        that do not need a transition remain untouched.
+
+        Parameters
+        ------------
+        face_index : (k, ) int
+          Original face indices defining the region to refine.
+          Duplicates are treated once and an empty selection
+          returns an unchanged copy.
+        max_edge
+          Maximum length allowed for any edge of a selected face
+        max_iter : int
+          The maximum number of subdivision passes; if the edge
+          length requirement is still not met a warning is logged
+          and the partially subdivided mesh is returned
+        return_index : bool
+          If True, also return the original face index of each
+          new face
+
+        Returns
+        ------------
+        mesh : trimesh.Trimesh
+          A copy of the mesh with the selected region subdivided
+        index : (q, ) int64
+          Only returned when `return_index` is True
+        """
+        vertices, faces, final_index = remesh.subdivide_to_size_selected(
+            vertices=self.vertices,
+            faces=self.faces,
+            face_index=face_index,
+            max_edge=max_edge,
+            max_iter=max_iter,
+            return_index=True,
+        )
+
+        # create a new mesh without mutating the source
+        result = Trimesh(vertices=vertices, faces=faces, process=False)
+
+        if return_index:
+            return result, final_index
+
+        return result
+
     def subdivide_loop(self, iterations: Integer | None = None) -> "Trimesh":
         """
         Subdivide a mesh by dividing each triangle into four

@@ -290,6 +290,235 @@ class SubDivideTest(g.unittest.TestCase):
         test([1, 0])
 
 
+class SubDivideSelectedTest(g.unittest.TestCase):
+    def test_basic(self):
+        # refine a region of a closed mesh: edge length, area,
+        # orientation, original-face mapping and watertightness
+        meshes = [
+            g.trimesh.creation.box(),
+            g.trimesh.creation.icosphere(subdivisions=2),
+        ]
+        for m in meshes:
+            verts_before, faces_before = m.vertices.copy(), m.faces.copy()
+            max_edge = m.scale / 30
+            selected = [0, len(m.faces) // 2, len(m.faces) - 1]
+
+            sub, index = m.subdivide_to_size_selected(
+                face_index=selected, max_edge=max_edge, return_index=True
+            )
+
+            # input is never modified
+            assert g.np.array_equal(m.vertices, verts_before)
+            assert g.np.array_equal(m.faces, faces_before)
+
+            # the region got denser
+            assert len(sub.faces) > len(m.faces)
+            # one original-face index per new face
+            assert len(index) == len(sub.faces)
+            assert index.min() >= 0 and index.max() <= len(m.faces) - 1
+
+            # every edge of a face descending from a selected face
+            # must satisfy the length requirement
+            for fi in selected:
+                edges = g.np.sort(
+                    g.trimesh.geometry.faces_to_edges(sub.faces[index == fi]), axis=1
+                )
+                unique_edges = g.np.unique(edges, axis=0)
+                lengths = g.np.linalg.norm(
+                    sub.vertices[unique_edges[:, 0]]
+                    - sub.vertices[unique_edges[:, 1]],
+                    axis=1,
+                )
+                assert (lengths <= max_edge + 1e-12).all()
+
+            # total area and volume are preserved
+            assert g.np.isclose(m.area, sub.area)
+            assert g.np.isclose(m.volume, sub.volume)
+
+            # each child face keeps the winding of its original face
+            normals = g.np.cross(
+                sub.triangles[:, 1] - sub.triangles[:, 0],
+                sub.triangles[:, 2] - sub.triangles[:, 0],
+            )
+            normals /= g.np.linalg.norm(normals, axis=1, keepdims=True)
+            dots = (normals * m.face_normals[index]).sum(axis=1)
+            assert (dots > 1 - 1e-6).all()
+
+            # area is conserved per original face
+            for fi in range(len(m.faces)):
+                area_new = g.trimesh.triangles.area(sub.triangles[index == fi]).sum()
+                assert g.np.isclose(area_new, m.area_faces[fi])
+
+            # original-face mapping is correct: every new vertex lies
+            # on the original face it claims to descend from
+            epsilon = 1e-3
+            for vid in sub.faces.T:
+                bary = g.trimesh.triangles.points_to_barycentric(
+                    m.triangles[index], sub.vertices[vid]
+                )
+                assert bary.max() < 1 + epsilon
+                assert bary.min() > -epsilon
+                assert g.np.ptp(bary) > epsilon
+
+            # closed input stays closed and conforming (no T-junctions)
+            assert m.is_watertight
+            assert sub.is_watertight
+            edges = g.np.sort(
+                g.trimesh.geometry.faces_to_edges(sub.faces), axis=1
+            )
+            _, counts = g.np.unique(edges, axis=0, return_counts=True)
+            # every edge of a closed manifold mesh borders exactly two faces
+            assert set(g.np.unique(counts)) == {2}
+
+    def test_locality(self):
+        # neighbors only change when a shared edge needs a transition
+        m = g.trimesh.creation.icosphere(subdivisions=2)
+        selected = 0
+        max_edge = m.edges_unique_length.min() * 0.5
+
+        sub, index = m.subdivide_to_size_selected(
+            face_index=[selected], max_edge=max_edge, return_index=True
+        )
+
+        adjacency = m.face_adjacency
+        neighbors = set(
+            adjacency[g.np.any(adjacency == selected, axis=1)].ravel()
+        ) - {selected}
+
+        new_sets = [tuple(sorted(f)) for f in sub.faces]
+        original_sets = {
+            fi: tuple(sorted(f)) for fi, f in enumerate(m.faces)
+        }
+        unchanged = {
+            fi for fi, face in original_sets.items() if face in new_sets
+        }
+
+        # the selected face was refined
+        assert selected not in unchanged
+        # every face away from the selection and its ring of neighbors
+        # passes through completely untouched
+        for fi in range(len(m.faces)):
+            if fi != selected and fi not in neighbors:
+                assert fi in unchanged
+        # faces not derived from the selection keep their original index
+        assert set(index) == set(range(len(m.faces)))
+
+    def test_empty(self):
+        # an empty selection returns an unchanged copy and does not
+        # mutate the source mesh
+        for empty in (None, [], g.np.array([], dtype=g.np.int64)):
+            m = g.trimesh.creation.box()
+            before_v, before_f = m.vertices.copy(), m.faces.copy()
+            sub, index = m.subdivide_to_size_selected(
+                face_index=empty, max_edge=0.1, return_index=True
+            )
+            assert g.np.array_equal(sub.vertices, before_v)
+            assert g.np.array_equal(sub.faces, before_f)
+            assert g.np.array_equal(index, g.np.arange(len(before_f)))
+            # distinct object: mutating the result leaves the source alone
+            assert sub is not m
+            assert g.np.array_equal(m.vertices, before_v)
+            assert g.np.array_equal(m.faces, before_f)
+
+    def test_duplicates(self):
+        # repeated indices are treated exactly once
+        m = g.trimesh.creation.box()
+        once, idx_once = m.subdivide_to_size_selected(
+            face_index=[2, 4], max_edge=0.3, return_index=True
+        )
+        repeated, idx_repeated = m.subdivide_to_size_selected(
+            face_index=[2, 4, 2, 4, 2],
+            max_edge=0.3,
+            return_index=True,
+        )
+        assert g.np.array_equal(once.faces, repeated.faces)
+        assert g.np.array_equal(once.vertices, repeated.vertices)
+        assert g.np.array_equal(idx_once, idx_repeated)
+
+    def test_invalid(self):
+        m = g.trimesh.creation.box()
+        for bad in ([len(m.faces)], [0, len(m.faces)], [-1], [0, -2]):
+            with self.assertRaises(ValueError):
+                m.subdivide_to_size_selected(face_index=bad, max_edge=0.1)
+            with self.assertRaises(ValueError):
+                g.trimesh.remesh.subdivide_to_size_selected(
+                    m.vertices, m.faces, face_index=bad, max_edge=0.1
+                )
+        # non-integer indices are rejected rather than silently truncated
+        with self.assertRaises(ValueError):
+            m.subdivide_to_size_selected(face_index=[0.5], max_edge=0.1)
+
+    def test_max_iter(self):
+        # hitting the iteration limit warns instead of raising and
+        # returns a conforming, still-watertight partial result
+        m = g.trimesh.creation.box()
+        with self.assertLogs("trimesh.util", level="WARNING") as ctx:
+            sub = m.subdivide_to_size_selected(
+                face_index=[0], max_edge=1e-9, max_iter=1
+            )
+        assert any("max_iter" in msg and "incomplete" in msg for msg in ctx.output)
+        assert len(sub.faces) > len(m.faces)
+        assert sub.is_watertight
+        # the source mesh is untouched and the old API still raises
+        assert len(m.faces) == 12
+        with self.assertRaises(ValueError):
+            m.subdivide_to_size(max_edge=1e-9, max_iter=1)
+
+    def test_remesh_function(self):
+        # the functional entry point, including a triangle soup
+        mesh = g.get_mesh("soup.stl")
+        selected = [1, 2, 3]
+        max_edge = mesh.scale / 20
+
+        verts, faces, index = g.trimesh.remesh.subdivide_to_size_selected(
+            vertices=mesh.vertices,
+            faces=mesh.faces,
+            face_index=selected,
+            max_edge=max_edge,
+            return_index=True,
+        )
+        result = g.trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+
+        assert len(index) == len(faces)
+        assert g.np.isclose(mesh.area, result.area)
+
+        # selected faces meet the edge length requirement
+        for fi in selected:
+            edges = g.np.sort(
+                g.trimesh.geometry.faces_to_edges(faces[index == fi]), axis=1
+            )
+            unique_edges = g.np.unique(edges, axis=0)
+            lengths = g.np.linalg.norm(
+                verts[unique_edges[:, 0]] - verts[unique_edges[:, 1]],
+                axis=1,
+            )
+            assert (lengths <= max_edge + 1e-12).all()
+
+        # orientation and original-face mapping stay consistent
+        normals = g.np.cross(
+            result.triangles[:, 1] - result.triangles[:, 0],
+            result.triangles[:, 2] - result.triangles[:, 0],
+        )
+        normals /= g.np.linalg.norm(normals, axis=1, keepdims=True)
+        dots = (normals * mesh.face_normals[index]).sum(axis=1)
+        assert (dots > 1 - 1e-6).all()
+
+        epsilon = 1e-3
+        for vid in faces.T:
+            bary = g.trimesh.triangles.points_to_barycentric(
+                mesh.triangles[index], verts[vid]
+            )
+            assert bary.max() < 1 + epsilon
+            assert bary.min() > -epsilon
+            assert g.np.ptp(bary) > epsilon
+
+        # without return_index the signature stays two arrays
+        verts2, faces2 = g.trimesh.remesh.subdivide_to_size_selected(
+            mesh.vertices, mesh.faces, face_index=selected, max_edge=max_edge
+        )
+        assert g.np.array_equal(verts, verts2) and g.np.array_equal(faces, faces2)
+
+
 if __name__ == "__main__":
     g.trimesh.util.attach_to_log()
     g.unittest.main()
