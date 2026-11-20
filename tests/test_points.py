@@ -367,6 +367,137 @@ def test_estimate_normals_sphere():
     assert g.np.all(g.np.bitwise_xor(mask_close_to_zeros, mask_close_to_pi))
 
 
+def _plane_points(normal, offset, count=15, noise=0.0, seed=0):
+    # generate a grid of points on a plane with optional noise
+    normal = g.np.asarray(normal, dtype=g.np.float64)
+    normal /= g.np.linalg.norm(normal)
+    axis = g.np.eye(3)[g.np.abs(normal).argmin()]
+    u = g.np.cross(normal, axis)
+    u /= g.np.linalg.norm(u)
+    v = g.np.cross(normal, u)
+    grid = g.np.linspace(-1.0, 1.0, count)
+    a, b = g.np.meshgrid(grid, grid)
+    points = a.ravel()[:, None] * u + b.ravel()[:, None] * v
+    points += offset * normal
+    if noise > 0.0:
+        rng = g.np.random.default_rng(seed)
+        points += rng.normal(scale=noise, size=points.shape)
+    return points, normal
+
+
+def test_orient_normals_noisy_surface():
+    # a noisy plane should get a single consistent orientation
+    points, normal = _plane_points([0.3, -0.2, 1.0], offset=3.0, noise=0.01)
+    original = points.copy()
+
+    oriented, valid, unconstrained = g.trimesh.points.orient_normals(
+        points, reference={0: normal}, max_distance=0.5, cluster_size=15
+    )
+    assert valid.all()
+    assert not unconstrained.any()
+    assert g.np.isfinite(oriented).all()
+    assert (oriented @ normal > 0.9).all()
+    # input coordinates must not be modified
+    assert g.np.array_equal(points, original)
+
+    # randomly flipped input normals should be re-oriented identically
+    rng = g.np.random.default_rng(1)
+    normals = g.trimesh.points.PointCloud(points).estimate_normals(15)
+    flipped = normals * rng.choice([-1.0, 1.0], size=len(points))[:, None]
+    reoriented, valid2, _ = g.trimesh.points.orient_normals(
+        points, normals=flipped, reference={0: normal}, max_distance=0.5
+    )
+    assert valid2.all()
+    assert (reoriented @ normal > 0.9).all()
+
+
+def test_orient_normals_multiple_components():
+    # two well separated planes form two connected components
+    points_1, normal_1 = _plane_points([0.0, 0.0, 1.0], offset=0.0)
+    points_2, normal_2 = _plane_points([0.0, 0.0, 1.0], offset=50.0)
+    points = g.np.vstack((points_1, points_2))
+    count_1 = len(points_1)
+
+    # only the first component gets a reference direction
+    oriented, valid, unconstrained = g.trimesh.points.orient_normals(
+        points, reference={0: normal_1}, max_distance=0.5, cluster_size=15
+    )
+    assert valid.all()
+    # constrained component follows the reference
+    assert not unconstrained[:count_1].any()
+    assert (oriented[:count_1] @ normal_1 > 0.9).all()
+    # unconstrained component is flagged but still locally consistent
+    assert unconstrained[count_1:].all()
+    dots = oriented[count_1:] @ normal_2
+    assert (g.np.abs(dots) > 0.9).all()
+    assert (dots > 0.0).all() or (dots < 0.0).all()
+
+
+def test_orient_normals_duplicate_points():
+    # exact duplicate points have a zero covariance neighborhood
+    points, normal = _plane_points([0.0, 0.0, 1.0], offset=0.0)
+    duplicates = g.np.tile([10.0, 10.0, 10.0], (12, 1))
+    points = g.np.vstack((points, duplicates))
+    count_plane = len(points) - len(duplicates)
+
+    oriented, valid, _ = g.trimesh.points.orient_normals(
+        points, reference={0: normal}, max_distance=0.5, cluster_size=10
+    )
+    assert valid[:count_plane].all()
+    assert not valid[count_plane:].any()
+    # no NaN allowed: degenerate points get the fallback normal
+    assert g.np.isfinite(oriented).all()
+    assert g.np.allclose(oriented[count_plane:], [0.0, 0.0, 1.0])
+
+    # a reference direction on a degenerate point can't be honored
+    with g.pytest.raises(ValueError):
+        g.trimesh.points.orient_normals(
+            points,
+            reference={len(points) - 1: normal},
+            max_distance=0.5,
+            cluster_size=10,
+        )
+
+
+def test_orient_normals_degenerate_neighborhood():
+    # collinear points don't span a surface
+    t = g.np.linspace(0.0, 1.0, 20)
+    line = g.np.column_stack((t, 0.5 * t, -t))
+    oriented, valid, _ = g.trimesh.points.orient_normals(line, cluster_size=10)
+    assert not valid.any()
+    assert g.np.isfinite(oriented).all()
+    assert g.np.allclose(oriented, [0.0, 0.0, 1.0])
+
+
+def test_orient_normals_conflicting_references():
+    # adjacent points on one surface can't satisfy opposite references
+    points, normal = _plane_points([0.0, 0.0, 1.0], offset=0.0)
+    with g.pytest.raises(ValueError):
+        g.trimesh.points.orient_normals(
+            points,
+            reference={0: normal, 1: -normal},
+            max_distance=0.5,
+            cluster_size=15,
+        )
+
+
+def test_orient_normals_order_preserved():
+    # shuffling the points must shuffle the results identically
+    points, normal = _plane_points([0.2, 0.1, 1.0], offset=1.0, noise=0.01)
+    rng = g.np.random.default_rng(2)
+    order = rng.permutation(len(points))
+    inverse = g.np.argsort(order)
+
+    oriented, valid, _ = g.trimesh.points.orient_normals(
+        points[order],
+        reference={int(inverse[0]): normal},
+        max_distance=0.5,
+        cluster_size=15,
+    )
+    assert valid.all()
+    assert (oriented[inverse] @ normal > 0.9).all()
+
+
 def test_radial_sort_any_normal():
     theta = g.np.linspace(0.0, g.np.pi * 2.0, 12, endpoint=False)
     # ring radius varies so ordering is unambiguous

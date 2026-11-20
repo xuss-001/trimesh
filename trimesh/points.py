@@ -397,6 +397,213 @@ def plot_points(points, show=True):
         plt.show()
 
 
+def orient_normals(
+    points,
+    normals=None,
+    reference=None,
+    max_distance=None,
+    cluster_size=30,
+):
+    """
+    Orient point cloud normals consistently on each connected surface.
+
+    Normals estimated from local neighborhoods have an arbitrary sign
+    per point: this flips them so adjacent points on the same surface
+    agree and points with a supplied reference direction match it.
+
+    Parameters
+    ------------
+    points : (n, 3) float
+      Points in space: not modified and order is preserved.
+    normals : (n, 3) float or None
+      Estimated normals to orient, if None they are estimated from
+      the `cluster_size` nearest neighbors of each point.
+    reference : dict or (indices, directions) or None
+      Reference directions keyed by point index: the oriented normal
+      of each of these points is flipped to have a positive dot
+      product with the given direction.
+    max_distance : float or None
+      Maximum distance for two points to be considered adjacent:
+      points farther apart are never connected directly and each
+      connected component is oriented independently. If None this
+      is set to twice the median nearest neighbor distance.
+    cluster_size : int
+      Number of nearest neighbors used to estimate normals,
+      only used if `normals` is None.
+
+    Returns
+    ------------
+    oriented : (n, 3) float
+      Unit normals in the same order as `points` containing no NaN
+      values: degenerate points get a fallback of [0, 0, 1].
+    valid : (n,) bool
+      False for degenerate points where no normal could be estimated,
+      i.e. duplicate points or collinear neighborhoods.
+    unconstrained : (n,) bool
+      True for valid points in connected components containing no
+      reference direction, where the global orientation is arbitrary.
+
+    Raises
+    ---------
+    ValueError
+      If reference directions are out of bounds, unusable, reference
+      a degenerate point, or conflict with each other.
+    """
+    from scipy.sparse import csr_matrix
+    from scipy.sparse.csgraph import (
+        breadth_first_order,
+        connected_components,
+        minimum_spanning_tree,
+    )
+    from scipy.spatial import cKDTree
+
+    points = np.asarray(points, dtype=np.float64)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError("points must be (n, 3)")
+    count = len(points)
+
+    # replace non-finite coordinates so the tree doesn't choke:
+    # these points are marked invalid below anyway
+    finite = np.isfinite(points).all(axis=1)
+    safe = np.where(finite[:, None], points, 0.0)
+    tree = cKDTree(safe)
+
+    if normals is None:
+        k = min(max(int(cluster_size), 1), count)
+        if k >= 3:
+            _, indices = tree.query(safe, k=k)
+            clusters = safe[indices]
+            centroids = np.mean(clusters, axis=1, keepdims=True)
+            C = clusters - centroids
+            covariances = np.matmul(C.transpose(0, 2, 1), C) / (k - 1)
+            eigenvalues, eigenvectors = np.linalg.eigh(covariances)
+            normals = eigenvectors[:, :, 0]
+            # a surface needs spread in two directions: duplicate
+            # points or collinear neighborhoods are degenerate
+            valid = finite & (eigenvalues[:, 1] > 1e-10 * np.abs(eigenvalues[:, 2]))
+        else:
+            normals = np.zeros((count, 3))
+            valid = np.zeros(count, dtype=bool)
+    else:
+        normals = np.asarray(normals, dtype=np.float64)
+        if normals.shape != (count, 3):
+            raise ValueError("normals must be (n, 3)")
+        length = np.linalg.norm(normals, axis=1)
+        valid = finite & np.isfinite(length) & (length > 0.0)
+        normals = normals / np.where(valid, length, 1.0)[:, None]
+
+    # map between global point index and compact valid-only index
+    valid_index = np.nonzero(valid)[0]
+    local = np.full(count, -1, dtype=np.int64)
+    local[valid_index] = np.arange(len(valid_index))
+    unconstrained = np.zeros(count, dtype=bool)
+
+    if max_distance is None:
+        if count > 1:
+            distance, _ = tree.query(safe, k=2)
+            max_distance = 2.0 * float(np.median(distance[:, 1]))
+        else:
+            max_distance = 0.0
+
+    # connect valid points closer than the distance limit
+    pairs = tree.query_pairs(max_distance, output_type="ndarray")
+    pairs = pairs[valid[pairs].all(axis=1)]
+    edges = local[pairs]
+    edges = np.vstack((edges, edges[:, ::-1])).reshape((-1, 2))
+    adjacency = csr_matrix(
+        (np.ones(len(edges)), (edges[:, 0], edges[:, 1])),
+        shape=(len(valid_index),) * 2,
+    )
+    _, labels = connected_components(adjacency, directed=False)
+
+    # parse reference directions into a required sign per valid point
+    required = {}
+    if reference is not None:
+        if isinstance(reference, dict):
+            items = reference.items()
+        else:
+            indices, directions = reference
+            items = zip(
+                np.asarray(indices).ravel(),
+                np.asarray(directions, dtype=np.float64).reshape((-1, 3)),
+            )
+        for index, direction in items:
+            index = int(index)
+            if index < 0 or index >= count:
+                raise ValueError(
+                    f"reference index {index} out of bounds for {count} points"
+                )
+            direction = np.asarray(direction, dtype=np.float64)
+            length = np.linalg.norm(direction)
+            if not np.isfinite(length) or length == 0.0:
+                raise ValueError(
+                    f"reference direction for point {index} is not a usable vector"
+                )
+            if not valid[index]:
+                raise ValueError(
+                    f"reference direction given for degenerate point {index}"
+                )
+            dot = float(np.dot(normals[index], direction / length))
+            if dot == 0.0:
+                raise ValueError(
+                    f"reference direction for point {index} is"
+                    " perpendicular to its estimated normal"
+                )
+            sign = 1.0 if dot > 0.0 else -1.0
+            key = local[index]
+            if key in required and required[key] != sign:
+                raise ValueError(
+                    f"conflicting reference directions for point {index}"
+                )
+            required[key] = sign
+
+    # propagate a sign through a spanning tree of each component
+    sign = np.ones(len(valid_index))
+    for label in np.unique(labels):
+        nodes = np.nonzero(labels == label)[0]
+        constraints = {node: required[node] for node in nodes if node in required}
+        if len(constraints) == 0:
+            # no reference direction: global orientation is arbitrary
+            unconstrained[valid_index[nodes]] = True
+        root = next(iter(constraints)) if constraints else nodes[0]
+        sign[root] = constraints.get(root, 1.0)
+        if len(nodes) > 1:
+            position = np.full(len(valid_index), -1, dtype=np.int64)
+            position[nodes] = np.arange(len(nodes))
+            sub = adjacency[nodes][:, nodes]
+            row, col = sub.nonzero()
+            # prefer propagating across edges where normals agree
+            agreement = np.abs(
+                np.einsum(
+                    "ij,ij->i",
+                    normals[valid_index[nodes[row]]],
+                    normals[valid_index[nodes[col]]],
+                )
+            )
+            weighted = csr_matrix((2.0 - agreement, (row, col)), shape=sub.shape)
+            spanning = minimum_spanning_tree(weighted)
+            order, predecessors = breadth_first_order(
+                spanning, position[root], directed=False
+            )
+            for s in order[1:]:
+                node, parent = nodes[s], nodes[predecessors[s]]
+                agree = np.dot(
+                    normals[valid_index[node]], normals[valid_index[parent]]
+                )
+                sign[node] = sign[parent] if agree >= 0.0 else -sign[parent]
+        for node, want in constraints.items():
+            if sign[node] != want:
+                raise ValueError(
+                    "reference directions conflict: points"
+                    f" {valid_index[root]} and {valid_index[node]} require"
+                    " inconsistent orientations on the same connected surface"
+                )
+
+    oriented = np.tile([0.0, 0.0, 1.0], (count, 1))
+    oriented[valid_index] = normals[valid_index] * sign[:, None]
+    return oriented, valid, unconstrained
+
+
 class PointCloud(Geometry3D):
     """
     Hold 3D points in an object which can be visualized
@@ -789,3 +996,35 @@ class PointCloud(Geometry3D):
         covariances = np.matmul(C.transpose(0, 2, 1), C) / (cluster_size - 1)
         _, v = np.linalg.eigh(covariances)
         return v[:, :, 0]
+
+    def orient_normals(self, reference=None, max_distance=None, cluster_size=30):
+        """
+        Orient estimated normals consistently on each connected surface.
+
+        Parameters
+        ------------
+        reference : dict or (indices, directions) or None
+          Reference directions keyed by point index which the oriented
+          normals are flipped to agree with.
+        max_distance : float or None
+          Maximum distance for two points to be considered adjacent:
+          each connected component is oriented independently. If None
+          estimated from the median nearest neighbor distance.
+        cluster_size : int
+          Number of nearest neighbors used to estimate normals.
+
+        Returns
+        ------------
+        oriented : (n, 3) float
+          Consistently oriented unit normals containing no NaN values.
+        valid : (n,) bool
+          False for degenerate points where no normal could be estimated.
+        unconstrained : (n,) bool
+          True for points in components with no reference direction.
+        """
+        return orient_normals(
+            self.vertices,
+            reference=reference,
+            max_distance=max_distance,
+            cluster_size=cluster_size,
+        )
