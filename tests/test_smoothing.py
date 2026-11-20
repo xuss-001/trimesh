@@ -62,6 +62,212 @@ def explicit_laplacian_calculation(mesh, equal_weight=True, pinned_vertices=None
 
 
 class SmoothTest(g.unittest.TestCase):
+    def planar_grid(self, side=5, noise=None, seed=0):
+        """
+        Build an open planar triangle grid with ``side * side`` vertices.
+        """
+        xs, ys = g.np.meshgrid(g.np.arange(side), g.np.arange(side))
+        vertices = g.np.column_stack(
+            [xs.ravel(), ys.ravel(), g.np.zeros(side * side)]
+        ).astype(float)
+        faces = []
+        for i in range(side - 1):
+            for j in range(side - 1):
+                a = i * side + j
+                b = i * side + j + 1
+                c = (i + 1) * side + j
+                d = (i + 1) * side + j + 1
+                faces.append([a, b, d])
+                faces.append([a, d, c])
+        mesh = g.trimesh.Trimesh(
+            vertices=vertices, faces=faces, process=False
+        )
+        if noise is not None:
+            rng = g.np.random.default_rng(seed)
+            mesh.vertices += rng.normal(scale=noise, size=mesh.vertices.shape)
+        return mesh
+
+    def test_feature_preserving_pins_open_boundary(self):
+        mesh = self.planar_grid(side=5)
+        pinned = g.trimesh.smoothing.get_pinned_vertices(
+            mesh, feature_angle=g.np.pi / 2
+        )
+
+        # every coplanar interior edge is smooth, only boundary vertices
+        # are pinned
+        boundary = {
+            index
+            for index in range(len(mesh.vertices))
+            if index < 5 or index >= 20 or index % 5 in (0, 4)
+        }
+        assert set(pinned.tolist()) == boundary
+
+        before = mesh.vertices.copy()
+        g.trimesh.smoothing.filter_feature_preserving(
+            mesh, feature_angle=g.np.pi / 2, iterations=5
+        )
+        assert g.np.allclose(mesh.vertices[list(boundary)], before[list(boundary)])
+
+    def test_feature_preserving_reduces_surface_noise(self):
+        mesh = self.planar_grid(side=7, noise=0.1)
+        original = mesh.vertices.copy()
+
+        interior = g.np.ones(len(mesh.vertices), dtype=bool)
+        boundary = g.trimesh.smoothing.get_pinned_vertices(
+            mesh, feature_angle=g.np.pi / 2
+        )
+        interior[boundary] = False
+
+        g.trimesh.smoothing.filter_feature_preserving(
+            mesh, feature_angle=g.np.pi / 2, lamb=0.5, iterations=20
+        )
+
+        # noise on the free interior vertices is reduced towards z == 0
+        before = g.np.abs(original[interior, 2]).mean()
+        after = g.np.abs(mesh.vertices[interior, 2]).mean()
+        assert after < before * 0.5
+        # the protected boundary never drifts
+        assert g.np.allclose(mesh.vertices[boundary], original[boundary])
+
+    def test_feature_preserving_keeps_hard_crease(self):
+        # start from a planar grid and fold one half about the middle row,
+        # producing an interior crease whose endpoints are not on the
+        # open boundary
+        mesh = self.planar_grid(side=5)
+        fold = g.np.pi / 3
+        vertices = mesh.vertices.view(g.np.ndarray)
+        # fold the right-hand wing about the y == 2 grid line so that
+        # the crease edges align with edges of the triangulation
+        right = vertices[:, 0] >= 2.0
+        distance = vertices[right, 0] - 2.0
+        vertices[right, 0] = 2.0 + distance * g.np.cos(fold)
+        vertices[right, 2] = distance * g.np.sin(fold)
+        mesh = g.trimesh.Trimesh(
+            vertices=vertices,
+            faces=mesh.faces.view(g.np.ndarray),
+            process=False,
+        )
+        crease_angle = mesh.face_adjacency_angles.max()
+        crease_edges = mesh.face_adjacency_edges[
+            g.np.abs(mesh.face_adjacency_angles - crease_angle) < 1e-9
+        ]
+        assert len(crease_edges) > 0
+        crease_vertices = g.np.unique(crease_edges)
+
+        # at the crease angle itself, the crease endpoints must be pinned
+        pinned = g.trimesh.smoothing.get_pinned_vertices(
+            mesh, feature_angle=crease_angle
+        )
+        assert set(crease_vertices.tolist()).issubset(set(pinned.tolist()))
+
+        # a looser threshold does not treat the fold as a feature
+        pinned_loose = g.trimesh.smoothing.get_pinned_vertices(
+            mesh, feature_angle=crease_angle + 0.1
+        )
+        boundary = set(
+            g.trimesh.smoothing.get_pinned_vertices(
+                mesh, feature_angle=g.np.pi
+            ).tolist()
+        )
+        interior_crease = [
+            vertex
+            for vertex in crease_vertices.tolist()
+            if vertex not in boundary
+        ]
+        assert len(interior_crease) > 0
+        assert not set(interior_crease).issubset(set(pinned_loose.tolist()))
+
+        before = mesh.vertices.copy()
+        g.trimesh.smoothing.filter_feature_preserving(
+            mesh, feature_angle=crease_angle, iterations=5
+        )
+        assert g.np.allclose(
+            mesh.vertices[crease_vertices], before[crease_vertices]
+        )
+
+    def test_feature_preserving_non_manifold_edge(self):
+        # three triangles fanning out of one shared edge: the shared edge
+        # is used by more than two faces and is therefore non-manifold
+        vertices = g.np.array(
+            [
+                [0, 0, 0],
+                [1, 0, 0],
+                [0, 1, 0],
+                [0, 0, 1],
+                [0, -1, 0],
+            ],
+            dtype=float,
+        )
+        faces = g.np.array([[0, 1, 2], [0, 1, 3], [1, 0, 4]])
+        mesh = g.trimesh.Trimesh(
+            vertices=vertices, faces=faces, process=False
+        )
+
+        pinned = g.trimesh.smoothing.get_pinned_vertices(mesh)
+        assert {0, 1}.issubset(set(pinned.tolist()))
+
+        before = mesh.vertices.copy()
+        g.trimesh.smoothing.filter_feature_preserving(mesh, iterations=5)
+        assert g.np.allclose(mesh.vertices[[0, 1]], before[[0, 1]])
+
+    def test_feature_preserving_isolated_vertex(self):
+        mesh = self.planar_grid(side=4)
+        mesh.vertices = g.np.vstack(
+            (mesh.vertices, [[7.0, 7.0, 7.0]])
+        )
+        isolated_index = len(mesh.vertices) - 1
+
+        pinned = g.trimesh.smoothing.get_pinned_vertices(mesh)
+        assert isolated_index in set(pinned.tolist())
+
+        # the operator must cover every vertex, including the isolated one
+        operator = g.trimesh.smoothing.laplacian_calculation(mesh)
+        assert operator.shape == (len(mesh.vertices), len(mesh.vertices))
+        assert not g.np.isnan(operator.toarray()).any()
+        weighted = g.trimesh.smoothing.laplacian_calculation(
+            mesh, equal_weight=False
+        )
+        assert weighted.shape == operator.shape
+        assert not g.np.isnan(weighted.toarray()).any()
+
+        before = mesh.vertices.copy()
+        g.trimesh.smoothing.filter_feature_preserving(mesh, iterations=5)
+        assert g.np.allclose(
+            mesh.vertices[isolated_index], before[isolated_index]
+        )
+
+    def test_feature_preserving_translation_invariant(self):
+        offset = g.np.array([10.0, -20.0, 30.0])
+        centered = self.planar_grid(side=5, noise=0.1)
+        translated = centered.copy()
+        translated.apply_translation(offset)
+
+        g.trimesh.smoothing.filter_feature_preserving(
+            centered, iterations=10
+        )
+        g.trimesh.smoothing.filter_feature_preserving(
+            translated, iterations=10
+        )
+
+        assert g.np.allclose(
+            translated.vertices - offset, centered.vertices, atol=1e-12
+        )
+
+    def test_feature_preserving_keeps_topology(self):
+        mesh = self.planar_grid(side=5, noise=0.1)
+        vertex_count = len(mesh.vertices)
+        faces_before = mesh.faces.copy()
+
+        g.trimesh.smoothing.filter_feature_preserving(mesh, iterations=5)
+
+        assert len(mesh.vertices) == vertex_count
+        assert g.np.array_equal(mesh.faces, faces_before)
+
+    def test_feature_preserving_invalid_angle(self):
+        mesh = self.planar_grid(side=3)
+        with self.assertRaises(ValueError):
+            g.trimesh.smoothing.get_pinned_vertices(mesh, feature_angle=-1.0)
+
     def test_laplacian_volume_constraint_is_translation_invariant(self):
         centered = g.trimesh.creation.icosahedron()
         translated = centered.copy()
