@@ -809,6 +809,32 @@ class Scene(Geometry3D):
         )
         return origins, vectors, pixels
 
+    def pick(self, ray_origins: ArrayLike, ray_directions: ArrayLike):
+        """
+        Cast rays at the scene while respecting material alpha.
+
+        See `trimesh.ray.ray_pick.pick_scene` for details: hits on
+        transparent regions of `MASK` textures pass through, `OPAQUE`
+        materials always block and `BLEND` materials raise. The
+        scene is not modified.
+
+        Parameters
+        ------------
+        ray_origins : (n, 3) float
+          Ray origin points in world coordinates.
+        ray_directions : (n, 3) float
+          Ray direction vectors in world coordinates.
+
+        Returns
+        ----------
+        results : list
+          One `RayPickResult` per ray or `None` for rays without a
+          valid hit.
+        """
+        from ..ray.ray_pick import pick_scene
+
+        return pick_scene(self, ray_origins, ray_directions)
+
     @property
     def camera(self) -> cameras.Camera:
         """
