@@ -3,7 +3,7 @@ import uuid
 import warnings
 from copy import deepcopy
 from hashlib import sha256
-from typing import TypeAlias
+from typing import NamedTuple, TypeAlias
 
 # ruff doesn't recognize this correctly when we re-import it from trimesh.typed -_-
 import numpy as np
@@ -31,6 +31,150 @@ from .transforms import SceneGraph
 
 # the types of objects we can create a scene from
 GeometryInput: TypeAlias = Geometry | Iterable[Geometry] | dict[str, Geometry] | ArrayLike
+
+
+class RayPickResult(NamedTuple):
+    """
+    The first visible hit along a ray.
+
+    Attributes
+    ----------
+    node_name
+      Name of the scene graph node which was hit.
+    face_index
+      Index of the hit face in the node's geometry.
+    point
+      World-space intersection point.
+    distance
+      Distance from the ray origin to the intersection point.
+    """
+
+    node_name: Hashable
+    face_index: int
+    point: NDArray[float64]
+    distance: float
+
+    @property
+    def node(self) -> Hashable:
+        return self.node_name
+
+    @property
+    def face(self) -> int:
+        return self.face_index
+
+    @property
+    def triangle_index(self) -> int:
+        return self.face_index
+
+    @property
+    def location(self) -> NDArray[float64]:
+        return self.point
+
+    def __getitem__(self, key):
+        if isinstance(key, str):
+            aliases = {
+                "node": "node_name",
+                "face": "face_index",
+                "triangle_index": "face_index",
+                "location": "point",
+            }
+            key = aliases.get(key, key)
+            if isinstance(key, str):
+                if key not in self._fields:
+                    raise KeyError(key)
+                key = self._fields.index(key)
+        return tuple.__getitem__(self, key)
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except (KeyError, IndexError):
+            return default
+
+
+def _ray_pick_uv(mesh, face_index, locations):
+    """
+    Interpolate UV coordinates for a set of points on mesh faces.
+    """
+    from .. import triangles as triangles_mod
+
+    visual = getattr(mesh, "visual", None)
+    uv = getattr(visual, "uv", None)
+    if uv is None:
+        return None
+
+    uv = np.asanyarray(uv, dtype=np.float64)
+    faces = np.asanyarray(mesh.faces)
+    face_index = np.asanyarray(face_index, dtype=np.int64)
+
+    if (
+        uv.ndim != 2
+        or uv.shape[1] < 2
+        or len(face_index) == 0
+        or len(uv) <= int(faces[face_index].max())
+    ):
+        return None
+
+    # barycentric coordinates are affine so this also works for the
+    # transformed triangle as long as the point was transformed back
+    barycentric = triangles_mod.points_to_barycentric(
+        mesh.triangles[face_index], locations
+    )
+    # ray hits on shared edges can land a hair outside the triangle
+    barycentric = np.clip(barycentric, 0.0, 1.0)
+    interpolated = np.einsum("ij,ijk->ik", barycentric, uv[faces[face_index]])
+
+    # the texture lookup wraps UVs so snap numerical noise at the
+    # 0.0 and 1.0 edges rather than wrapping it to the other side
+    edge = 1e-9
+    interpolated[np.abs(interpolated) < edge] = 0.0
+    interpolated[np.abs(interpolated - 1.0) < edge] = 1.0
+
+    return interpolated
+
+
+def _ray_pick_visible(mesh, face_index, locations):
+    """
+    Check which hits are visible after applying the material alpha rules.
+    """
+    from ..visual import color
+
+    visual = getattr(mesh, "visual", None)
+    material = getattr(visual, "material", None)
+    mode = getattr(material, "alphaMode", None)
+    mode = "OPAQUE" if mode is None else str(mode).upper()
+
+    if mode == "BLEND":
+        raise ValueError(
+            "BLEND alpha mode is not supported for ray picking: "
+            "only OPAQUE and MASK materials are supported"
+        )
+    if mode != "MASK":
+        return np.ones(len(locations), dtype=bool)
+
+    factor = getattr(material, "baseColorFactor", None)
+    if factor is None:
+        factor_alpha = 1.0
+    else:
+        factor_alpha = float(color.to_float(factor).reshape(-1)[3])
+
+    texture = getattr(material, "baseColorTexture", None)
+    if texture is None:
+        alpha = np.full(len(locations), factor_alpha, dtype=np.float64)
+    else:
+        uv = _ray_pick_uv(mesh=mesh, face_index=face_index, locations=locations)
+        if uv is None:
+            alpha = np.full(len(locations), factor_alpha, dtype=np.float64)
+        else:
+            sampled = color.uv_to_color(uv=uv, image=texture)
+            alpha = sampled[:, 3].astype(np.float64) / 255.0 * factor_alpha
+
+    cutoff = getattr(material, "alphaCutoff", None)
+    if cutoff is None:
+        # glTF default value for MASK
+        cutoff = 0.5
+
+    return alpha >= float(cutoff)
 
 
 class Scene(Geometry3D):
@@ -612,6 +756,141 @@ class Scene(Geometry3D):
         """
         populate = self.triangles  # NOQA
         return self._cache["triangles_node"]
+
+    def ray_pick(self, ray_origin=None, ray_direction=None, **kwargs):
+        """
+        Find the first visible hit along a ray, respecting material alpha.
+
+        glTF ``OPAQUE`` (and materials with no alpha mode) are treated as
+        opaque. For ``MASK`` materials the sampled texture alpha is multiplied
+        by the base color factor alpha and hits below ``alphaCutoff`` are
+        ignored. ``BLEND`` materials are not supported and raise a
+        ``ValueError``.
+
+        Parameters
+        ----------
+        ray_origin : (3,) float
+          Ray origin in world coordinates.
+        ray_direction : (3,) float
+          Ray direction in world coordinates.
+
+        Returns
+        -------
+        hit : RayPickResult or None
+          The closest visible ``(node_name, face_index, point, distance)``
+          tuple or ``None`` if every hit was missed or transparent.
+        """
+        if ray_origin is None:
+            ray_origin = kwargs.pop("origin", kwargs.pop("ray_origins", None))
+        if ray_direction is None:
+            ray_direction = kwargs.pop("direction", kwargs.pop("ray_directions", None))
+        if kwargs:
+            raise TypeError(f"unexpected keyword arguments: {sorted(kwargs)}")
+        if ray_origin is None or ray_direction is None:
+            raise ValueError("both ray origin and direction are required")
+
+        origin = np.asanyarray(ray_origin, dtype=np.float64)
+        direction = np.asanyarray(ray_direction, dtype=np.float64)
+
+        # accept a batch of rays and return a matching list of results
+        if origin.ndim == 2 or direction.ndim == 2:
+            origin = origin.reshape((-1, 3))
+            direction = direction.reshape((-1, 3))
+            if len(origin) != len(direction):
+                raise ValueError("ray origin and direction don't match")
+            return [
+                self.ray_pick(ray_origin=o, ray_direction=d)
+                for o, d in zip(origin, direction)
+            ]
+
+        origin = origin.reshape(3)
+        direction = direction.reshape(3)
+        length = np.linalg.norm(direction)
+        if not np.isfinite(length) or length < 1e-12:
+            raise ValueError("ray direction must be a non-zero finite vector")
+        direction = direction / length
+
+        # collect every raw hit so we can sort them in world-space distance
+        # order and discard transparent front-most hits
+        candidates = []
+        order = 0
+        for node_name in self.graph.nodes_geometry:
+            transform, geometry_name = self.graph[node_name]
+            geometry = self.geometry.get(geometry_name)
+            if (
+                geometry is None
+                or not hasattr(geometry, "ray")
+                or not hasattr(geometry, "triangles")
+            ):
+                continue
+
+            try:
+                inverse = np.linalg.inv(transform)
+            except np.linalg.LinAlgError:
+                continue
+
+            local_origin = transformations.transform_points(
+                origin.reshape((1, 3)), matrix=inverse
+            )[0]
+            local_direction = np.dot(inverse[:3, :3], direction)
+            if np.linalg.norm(local_direction) < 1e-12:
+                continue
+
+            locations, _, index_tri = geometry.ray.intersects_location(
+                local_origin.reshape((1, 3)),
+                local_direction.reshape((1, 3)),
+                multiple_hits=True,
+            )
+            if len(index_tri) == 0:
+                continue
+
+            world = transformations.transform_points(locations, matrix=transform)
+            vector = world - origin
+            distance = np.linalg.norm(vector, axis=1)
+            # ignore numerical hits behind the ray origin
+            forward = np.dot(vector, direction) > -1e-9
+            for i in np.nonzero(forward)[0]:
+                candidates.append(
+                    (
+                        float(distance[i]),
+                        order,
+                        node_name,
+                        geometry,
+                        int(index_tri[i]),
+                        world[i],
+                        locations[i],
+                    )
+                )
+                order += 1
+
+        if len(candidates) == 0:
+            return None
+
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        for (
+            distance,
+            _,
+            node_name,
+            geometry,
+            face_index,
+            point,
+            local_point,
+        ) in candidates:
+            local_point = np.asanyarray(local_point, dtype=np.float64).reshape((1, 3))
+            visible = _ray_pick_visible(
+                mesh=geometry,
+                face_index=np.array([face_index], dtype=np.int64),
+                locations=local_point,
+            )
+            if visible[0]:
+                return RayPickResult(
+                    node_name=node_name,
+                    face_index=face_index,
+                    point=np.asanyarray(point, dtype=np.float64),
+                    distance=distance,
+                )
+
+        return None
 
     @caching.cache_decorator
     def geometry_identifiers(self) -> dict[str, str]:
