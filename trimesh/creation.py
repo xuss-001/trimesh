@@ -258,6 +258,7 @@ def sweep_polygon(
     polygon: "Polygon",
     path: ArrayLike,
     angles: ArrayLike | None = None,
+    scales: ArrayLike | None = None,
     cap: bool = True,
     connect: bool = True,
     kwargs: dict | None = None,
@@ -281,6 +282,15 @@ def sweep_polygon(
     angles : (n,) float
       Optional rotation angle relative to prior vertex
       at each vertex.
+    scales : (n, 2) float or None
+      Optional positive scale factors applied to the two
+      coordinate directions of the cross section at every path
+      vertex. The cross section is scaled about its own coordinate
+      origin, before the rotation into each slice plane, so the
+      inner and outer rings of a polygon with holes scale together.
+      When not provided the cross section is left unscaled. For a
+      closed path connected into one mesh the first and last scales
+      must be identical.
     cap
       If an open path is passed apply a cap to both ends.
     connect
@@ -309,8 +319,28 @@ def sweep_polygon(
         # set all angles to zero
         angles = np.zeros(len(path), dtype=np.float64)
 
+    if scales is not None:
+        scales = np.asanyarray(scales, dtype=np.float64)
+        if scales.shape != (len(path), 2):
+            raise ValueError(
+                f"scales must have shape ({len(path)}, 2), got {scales.shape}"
+            )
+        if not np.isfinite(scales).all() or np.any(scales <= 0.0):
+            raise ValueError("scales must be finite and strictly positive!")
+    else:
+        # no per-vertex scaling: every cross section keeps its size
+        scales = np.ones((len(path), 2), dtype=np.float64)
+
     # check to see if path is closed i.e. first and last vertex are the same
     closed = np.linalg.norm(path[0] - path[-1]) < tol.merge
+
+    if closed and connect and not np.allclose(scales[0], scales[-1]):
+        raise ValueError(
+            "closed connected path requires identical first and last "
+            "cross-section scales, otherwise the shared seam would have "
+            "two conflicting cross sections"
+        )
+
     # Extract 2D vertices and triangulation
     vertices_2D, faces_2D = triangulate_polygon(polygon, **triangulation)
 
@@ -400,9 +430,16 @@ def sweep_polygon(
             check = tf.transform_points([[0.0, 0.0, 1.0]], matrix, translate=False)[0]
             assert np.allclose(check, n)
 
-    # apply transforms to prebaked homogeneous coordinates
+    # apply transforms to prebaked homogeneous coordinates:
+    # first scale the 2D cross section about its coordinate origin
+    # (inner and outer rings share these coordinates) and only then
+    # apply the slice rotation and translation
     vertices_3D = np.concatenate(
-        [np.dot(vertices_tf, matrix.T) for matrix in transforms], axis=0
+        [
+            np.dot(vertices_tf * np.r_[scale, 1.0, 1.0], matrix.T)
+            for scale, matrix in zip(scales, transforms)
+        ],
+        axis=0,
     )[:, :3]
 
     # now construct the faces with one group of boundary faces per slice
