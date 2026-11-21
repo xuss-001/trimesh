@@ -531,6 +531,46 @@ class Line(Entity):
         """
         return self._orient(vertices[self.points])
 
+    def sample_at_distance(self, vertices, distance):
+        """
+        Evaluate points on the entity at arc lengths measured
+        from the start of the entity in its traversal direction.
+
+        Parameters
+        ------------
+        vertices : (n, dimension) float
+          Points in space
+        distance : (m,) float
+          Arc length from the traversal start of the entity.
+
+        Returns
+        ----------
+        points : (m, dimension) float
+          Points on the entity at the requested arc lengths.
+        """
+        # get the polyline in traversal direction
+        points = self._orient(vertices[self.points])
+        # cumulative length at every vertex of the polyline
+        cum = np.concatenate(
+            ([0.0], np.cumsum(np.linalg.norm(np.diff(points, axis=0), axis=1)))
+        )
+        distance = np.asanyarray(distance, dtype=np.float64)
+        # find the segment each requested distance lies on
+        index = np.clip(
+            np.searchsorted(cum, distance, side="right") - 1, 0, len(points) - 2
+        )
+        # the length of each segment being interpolated on
+        segment = cum[index + 1] - cum[index]
+        # how far along each segment is the requested distance
+        fraction = np.divide(
+            distance - cum[index],
+            segment,
+            out=np.zeros_like(distance),
+            where=segment > 0,
+        )
+        offset = fraction.reshape((-1, 1)) * (points[index + 1] - points[index])
+        return points[index] + offset
+
     @property
     def closed(self):
         return len(self.points) > 2 and self.points[0] == self.points[-1]
@@ -669,6 +709,42 @@ class Arc(Entity):
         # get the angular span of the circular arc
         fit = self.center(vertices, return_normal=False, return_angle=True)
         return fit.span * fit.radius
+
+    def sample_at_distance(self, vertices, distance):
+        """
+        Evaluate points on the arc at arc lengths measured
+        from the start of the entity in its traversal direction.
+
+        Parameters
+        ------------
+        vertices : (n, dimension) float
+          Points in space
+        distance : (m,) float
+          Arc length from the traversal start of the entity.
+
+        Returns
+        ----------
+        points : (m, dimension) float
+          Points on the arc at the requested arc lengths.
+        """
+        # pad 2D points to 3D so cross products can be used
+        points, is_2D = util.stack_3D(vertices[self.points], return_2D=True)
+        # find the center information of the arc
+        info = arc_center(points)
+        # a closed arc is a complete circle
+        span = np.pi * 2 if self.closed else info.span
+        # the angle from the traversal start of the arc
+        theta = np.asanyarray(distance, dtype=np.float64) / info.radius
+        if getattr(self, "_direction", 1) < 0:
+            # traversed from the last control point to the first
+            theta = span - theta
+        # use the same vector formula as `discretize_arc`
+        V1 = util.unitize(points[0] - info.center)
+        V2 = util.unitize(np.cross(-info.normal, V1))
+        theta = theta.reshape((-1, 1))
+        sampled = (np.cos(theta) * V1 + np.sin(theta) * V2) * info.radius + info.center
+        # clip back to the dimension of the input
+        return sampled[:, : (3 - is_2D)]
 
     def discrete(self, vertices, scale=1.0):
         """

@@ -46,7 +46,7 @@ from . import (
     simplify,
     traversal,
 )
-from .entities import Entity
+from .entities import Arc, Entity, Line
 from .exchange.export import export_path
 from .util import concatenate
 
@@ -320,6 +320,103 @@ class Path(parent.Geometry):
         """
         length = float(sum(i.length(self.vertices) for i in self.entities))
         return length
+
+    def sample_at_interval(self, step):
+        """
+        Sample points along the entities of the path at even
+        arc-length intervals using the exact length of `Line`
+        and `Arc` entities rather than a discretized polyline.
+
+        Sampling starts at the first point of the first entity and
+        continues across entity junctions without resetting the
+        distance. Open paths include both end points while closed
+        paths don't repeat the start point, and the final segment
+        may be shorter than `step`.
+
+        Parameters
+        ------------
+        step : float
+          Arc-length distance between samples, must be a
+          positive finite value.
+
+        Returns
+        ---------
+        points : (n, dimension) float
+          Sampled points in space.
+        entity_index : (n,) int
+          Index of the entity each point was sampled from. A point
+          exactly on the junction of two entities is attributed to
+          the later entity and the end point of an open path to the
+          last entity.
+        distance : (n,) float
+          Arc length from the traversal start of the attributed
+          entity to the sampled point.
+        """
+        step = float(step)
+        if not np.isfinite(step) or step <= 0.0:
+            raise ValueError("`step` must be a positive finite value!")
+
+        dimension = self.vertices.shape[1] if self.vertices.ndim == 2 else 2
+        empty = (
+            np.zeros((0, dimension)),
+            np.array([], dtype=np.int64),
+            np.array([], dtype=np.float64),
+        )
+        if len(self.entities) == 0:
+            return empty
+        if not all(isinstance(e, (Line, Arc)) for e in self.entities):
+            raise ValueError("only `Line` and `Arc` entities are supported!")
+
+        vertices = self.vertices
+        # the exact arc length of every entity in traversal order
+        lengths = np.array([e.length(vertices) for e in self.entities])
+        total = lengths.sum()
+        if total < tol.zero:
+            return empty
+
+        # evenly spaced arc lengths from the start of the path
+        distance = np.arange(0.0, total, step)
+        epsilon = 1e-9 * max(total, step)
+
+        # check if the path forms a closed loop by comparing the
+        # traversal start of the first entity with the traversal
+        # end of the last entity where discrete end points are
+        # exact control points
+        start = self.entities[0].discrete(vertices)[0]
+        end = self.entities[-1].discrete(vertices)[-1]
+        closed = np.linalg.norm(start - end) < tol.merge
+
+        if closed:
+            # a sample at the total length would duplicate the start
+            if len(distance) > 0 and total - distance[-1] < epsilon:
+                distance = distance[:-1]
+        elif len(distance) == 0 or total - distance[-1] > epsilon:
+            # open paths always include their final point
+            distance = np.append(distance, total)
+        else:
+            # snap the last sample to the exact end of the path
+            distance[-1] = total
+
+        # cumulative arc length at the traversal start of each entity
+        cumulative = np.concatenate(([0.0], np.cumsum(lengths)))
+        # a sample exactly on a junction belongs to the later entity
+        # and the final point of an open path to the last entity
+        entity_index = np.clip(
+            np.searchsorted(cumulative, distance, side="right") - 1,
+            0,
+            len(self.entities) - 1,
+        )
+        # arc length from the start of the attributed entity
+        local = distance - cumulative[entity_index]
+
+        # evaluate every entity at its requested local arc lengths
+        points = np.zeros((len(distance), self.vertices.shape[1]))
+        for index, entity in enumerate(self.entities):
+            mask = entity_index == index
+            if mask.any():
+                points[mask] = entity.sample_at_distance(vertices, local[mask])
+
+        return points, entity_index, local
 
     @cache_decorator
     def bounds(self):
