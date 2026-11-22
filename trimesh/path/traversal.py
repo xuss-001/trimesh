@@ -5,6 +5,7 @@ import numpy as np
 
 from .. import constants, grouping, util
 from ..typed import ArrayLike, Integer, NDArray, Number
+from .entities import Arc, Line
 from .util import is_ccw
 
 try:
@@ -348,6 +349,305 @@ class PathSample:
         ) < constants.tol_path.merge
 
         return truncated
+
+
+class CurveSample:
+    """
+    Sample a connected path of analytic line and arc entities at
+    exact arc-length intervals.
+
+    Distances are accumulated continuously along the traversal so
+    sampling never restarts at an entity junction and never relies
+    on a coarse polyline approximation: lines are evaluated exactly
+    and arcs are evaluated on their circle using ``s = R * theta``.
+
+    Input entities and vertices are never modified; any entity whose
+    control points run against the traversal direction is handled
+    internally without calling :meth:`Entity.reverse`.
+    """
+
+    def __init__(self, entities, vertices, path, closed=None):
+        """
+        Parameters
+        ------------
+        entities : (m,) trimesh.path.entities.Entity
+          Line and Arc objects referenced by `path`.
+        vertices : (n, 2) or (n, 3) float
+          Vertex points referenced by the entities.
+        path : (k,) int
+          Entity indices giving the traversal order.
+        closed : bool or None
+          If ``None`` closure is detected from endpoint connectivity:
+          every endpoint shared by two entities means closed, while
+          dangling endpoints mean open.
+        """
+        vertices = np.asanyarray(vertices, dtype=np.float64)
+        path = np.asanyarray(path, dtype=np.int64).reshape(-1)
+        if len(path) == 0:
+            raise ValueError("cannot sample an empty path!")
+
+        # the ordered entities of the traversal
+        ordered = [entities[index] for index in path]
+        for entity in ordered:
+            if not isinstance(entity, (Line, Arc)):
+                raise TypeError(
+                    "arc-length sampling only supports Line and Arc entities"
+                )
+
+        # determine the traversal direction of each entity without
+        # mutating the entities themselves
+        if closed is None:
+            # a closed contour has every endpoint shared by exactly
+            # two entities, while an open contour has two dangling ends
+            degree = {}
+            for entity in ordered:
+                for node in entity.end_points:
+                    degree[int(node)] = degree.get(int(node), 0) + 1
+            closed = len(ordered) > 1 and all(
+                count == 2 for count in degree.values()
+            )
+        directions = self._orient(ordered, closed=closed)
+
+        # per-entity exact length and point-at-arc-length data
+        pieces = []
+        lengths = np.zeros(len(ordered), dtype=np.float64)
+        for index, (entity, direction) in enumerate(zip(ordered, directions)):
+            piece, lengths[index] = self._piece(
+                entity=entity,
+                vertices=vertices,
+                reverse=direction < 0,
+            )
+            pieces.append(piece)
+
+        # cumulative length, i.e. the global distance of each junction
+        self._bounds = np.append(0.0, np.cumsum(lengths))
+        self._total = float(self._bounds[-1])
+        self._pieces = pieces
+        self._dimension = vertices.shape[1]
+        # original entity index in `entities` for every ordered piece
+        self._entity_ids = np.asanyarray(path, dtype=np.int64)
+        self._closed = bool(closed)
+        self.length = self._total
+
+    @staticmethod
+    def _orient(ordered, closed):
+        """
+        Find a traversal direction (+1/-1) for every ordered entity
+        so that the end of one entity matches the start of the next.
+        """
+        directions = np.ones(len(ordered), dtype=np.int64)
+
+        if len(ordered) == 1:
+            # a single open entity is traversed as given; a closed
+            # circle is identical in either direction
+            return directions
+
+        for index in range(len(ordered) - 1):
+            current = ordered[index]
+            following = ordered[index + 1]
+            start, end = current.end_points[:: directions[index]]
+            other = following.end_points
+            shared = set(other) & {start, end}
+            if not shared:
+                raise ValueError("entities in path are not connected!")
+            shared = next(iter(shared))
+            if shared != end:
+                directions[index] *= -1
+            # the junction is the start of the following entity
+            directions[index + 1] = -1 if other[0] != shared else 1
+
+        if closed:
+            # verify the loop closes back on the first start point
+            start = ordered[0].end_points[:: directions[0]][0]
+            end = ordered[-1].end_points[:: directions[-1]][-1]
+            if start != end:
+                raise ValueError("closed path does not return to its start!")
+
+        return directions
+
+    @staticmethod
+    def _piece(entity, vertices, reverse):
+        """
+        Build exact point-at-arc-length data for one oriented entity.
+
+        Returns
+        ---------
+        piece : dict
+          Geometry evaluated along the traversal direction.
+        length : float
+          Exact length of the entity.
+        """
+        if not isinstance(entity, Arc):
+            points = vertices[entity.points]
+            if reverse:
+                points = points[::-1]
+            vectors = np.diff(points, axis=0)
+            segment = util.row_norm(vectors)
+            if np.any(segment <= constants.tol_path.zero):
+                raise ValueError("line entity contains zero-length segments!")
+            piece = {
+                "kind": "line",
+                "points": points,
+                "unit": vectors / segment.reshape((-1, 1)),
+                "cum": np.append(0.0, np.cumsum(segment)),
+            }
+            return piece, float(segment.sum())
+
+        fit = entity.center(vertices, return_normal=True, return_angle=True)
+        radius = fit.radius
+        points = vertices[entity.points]
+        if reverse:
+            # traverse the arc from its last control point backwards
+            points = points[::-1]
+            normal = -fit.normal
+        else:
+            normal = fit.normal
+        length = (
+            np.pi * 2.0 * radius if entity.closed else fit.span * radius
+        )
+
+        # v1 points from the center to the oriented start point; v2 is
+        # the unit tangent 90 degrees along the oriented arc direction.
+        # Its sign is taken from the actual control-point sweep rather
+        # than the fitted normal, which flips with arc handedness
+        v1 = util.unitize(points[0] - fit.center)
+        if points.shape[1] == 2:
+            radial = util.unitize(points[1] - fit.center)
+            side = v1[0] * radial[1] - v1[1] * radial[0]
+            v2 = np.array([-v1[1], v1[0]]) * np.sign(side)
+        else:
+            radial = util.unitize(points[1] - fit.center)
+            side = np.dot(np.cross(v1, radial), normal)
+            v2 = util.unitize(np.cross(normal, v1)) * np.sign(side)
+
+        piece = {
+            "kind": "arc",
+            "center": fit.center,
+            "radius": radius,
+            "v1": v1,
+            "v2": v2,
+        }
+        return piece, float(length)
+
+    def sample(self, step):
+        """
+        Return points sampled at constant arc-length spacing.
+
+        Parameters
+        ------------
+        step : float
+          Arc-length distance between consecutive samples.
+
+        Returns
+        ---------
+        points : (n, dimension) float
+          Sample coordinates in traversal order.
+        entity_ids : (n,) int
+          Original entity index each sample belongs to. A sample on
+          a junction is assigned to the later entity in the traversal;
+          the open-contour endpoint belongs to the last entity.
+        local : (n,) float
+          Arc length from the entity's traversal start to the sample.
+        """
+        step = float(step)
+        if not np.isfinite(step) or step <= 0.0:
+            raise ValueError("`step` must be a positive finite number!")
+
+        # floor-division based indices avoid np.arange float overshoot
+        if self._closed:
+            count = self._total / step
+            # snap near-integer divisions upward against float error
+            if np.isclose(count, round(count), rtol=1e-12):
+                count = int(round(count))
+            else:
+                count = int(np.floor(count))
+            if count < 1:
+                count = 1
+            distances = np.arange(count, dtype=np.float64) * step
+        else:
+            count = int(np.floor(self._total / step)) + 1
+            distances = np.arange(count, dtype=np.float64) * step
+            # the open contour always keeps its final endpoint, even
+            # when the remaining segment is shorter than `step`
+            if not np.isclose(distances[-1], self._total):
+                distances = np.append(distances, self._total)
+
+        # assign each distance to an entity; junctions go to the
+        # later entity, so use the right insertion side of the
+        # exclusive per-entity upper bounds
+        indices = np.searchsorted(self._bounds[1:], distances, side="right")
+        indices = np.clip(indices, 0, len(self._pieces) - 1)
+        local = distances - self._bounds[indices]
+
+        # evaluate every sample while preserving traversal order
+        points = self._evaluate(indices=indices, local=local)
+
+        return (
+            points,
+            self._entity_ids[indices],
+            local,
+        )
+
+    def _evaluate(self, indices, local):
+        """
+        Evaluate piece geometry at local arc-length values,
+        keeping the result in the input order.
+        """
+        points = np.zeros((len(indices), self._dimension))
+        for index in np.unique(indices):
+            chosen = indices == index
+            piece = self._pieces[index]
+            local_chosen = local[chosen]
+            if piece["kind"] == "line":
+                segment = np.searchsorted(
+                    piece["cum"][1:], local_chosen, side="right"
+                )
+                segment = np.clip(segment, 0, len(piece["unit"]) - 1)
+                offset = local_chosen - piece["cum"][segment]
+                points[chosen] = (
+                    piece["points"][segment]
+                    + piece["unit"][segment] * offset.reshape((-1, 1))
+                )
+            else:
+                angle = local_chosen / piece["radius"]
+                points[chosen] = (
+                    piece["center"]
+                    + piece["radius"]
+                    * (
+                        np.cos(angle).reshape((-1, 1)) * piece["v1"]
+                        + np.sin(angle).reshape((-1, 1)) * piece["v2"]
+                    )
+                )
+        return points
+
+
+def sample_arc_length(entities, vertices, path, step, closed=None):
+    """
+    Sample a connected line/arc contour at exact arc-length intervals.
+
+    Parameters
+    ------------
+    entities : (m,) trimesh.path.entities.Entity
+      Line and Arc objects referenced by `path`.
+    vertices : (n, 2) or (n, 3) float
+      Vertex points referenced by the entities.
+    path : (k,) int
+      Entity indices giving the traversal order.
+    step : float
+      Arc-length distance between consecutive samples.
+    closed : bool or None
+      If ``None`` closure is detected from endpoint connectivity.
+
+    Returns
+    ---------
+    points : (n, dimension) float
+      Sample coordinates in traversal order.
+    entity_ids : (n,) int
+      Original entity index each sample belongs to.
+    local : (n,) float
+      Arc length from the entity's traversal start to each sample.
+    """
+    return CurveSample(entities, vertices, path, closed=closed).sample(step)
 
 
 def resample_path(
