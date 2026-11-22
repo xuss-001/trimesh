@@ -258,6 +258,7 @@ def sweep_polygon(
     polygon: "Polygon",
     path: ArrayLike,
     angles: ArrayLike | None = None,
+    scales: ArrayLike | None = None,
     cap: bool = True,
     connect: bool = True,
     kwargs: dict | None = None,
@@ -281,6 +282,16 @@ def sweep_polygon(
     angles : (n,) float
       Optional rotation angle relative to prior vertex
       at each vertex.
+    scales : (n, 2) float
+      Optional positive per-vertex scale factors applied to the two
+      in-plane coordinate axes of the section, i.e. each row is
+      `(scale_x, scale_y)`. The scaling is centered on the section
+      coordinate origin and is applied *before* the rotation computed
+      from the path and `angles`, so the inner and outer contours of
+      polygons with holes are scaled together. When `None` every scale
+      factor is one and the result is unchanged. For a closed path with
+      `connect=True` the first and last rows must be identical as they
+      describe the same connecting section.
     cap
       If an open path is passed apply a cap to both ends.
     connect
@@ -309,8 +320,33 @@ def sweep_polygon(
         # set all angles to zero
         angles = np.zeros(len(path), dtype=np.float64)
 
+    if scales is None:
+        # keep the original section size at every vertex
+        scales = np.ones((len(path), 2), dtype=np.float64)
+    else:
+        scales = np.asanyarray(scales, dtype=np.float64)
+        if scales.shape != (len(path), 2):
+            raise ValueError(
+                f"`scales` must have shape ({len(path)}, 2), one "
+                "`(scale_x, scale_y)` row per path vertex, got shape "
+                f"{scales.shape}!"
+            )
+        if not np.isfinite(scales).all():
+            raise ValueError("`scales` must contain finite values!")
+        if np.any(scales <= 0.0):
+            raise ValueError(
+                "`scales` must contain strictly positive scale factors!"
+            )
+
     # check to see if path is closed i.e. first and last vertex are the same
     closed = np.linalg.norm(path[0] - path[-1]) < tol.merge
+    if closed and connect and not np.allclose(scales[0], scales[-1]):
+        raise ValueError(
+            "For a closed path with `connect=True` the first and last "
+            "`scales` rows must be identical as they describe the same "
+            "connecting section, but got "
+            f"{scales[0].tolist()} and {scales[-1].tolist()}!"
+        )
     # Extract 2D vertices and triangulation
     vertices_2D, faces_2D = triangulate_polygon(polygon, **triangulation)
 
@@ -400,9 +436,15 @@ def sweep_polygon(
             check = tf.transform_points([[0.0, 0.0, 1.0]], matrix, translate=False)[0]
             assert np.allclose(check, n)
 
-    # apply transforms to prebaked homogeneous coordinates
+    # apply the per-vertex section scaling (centered on the section
+    # origin, so only the 2D in-plane coordinates change) followed by the
+    # prebaked rotation and translation to each slice
     vertices_3D = np.concatenate(
-        [np.dot(vertices_tf, matrix.T) for matrix in transforms], axis=0
+        [
+            np.dot(vertices_tf * [scale[0], scale[1], 1.0, 1.0], matrix.T)
+            for scale, matrix in zip(scales, transforms)
+        ],
+        axis=0,
     )[:, :3]
 
     # now construct the faces with one group of boundary faces per slice
