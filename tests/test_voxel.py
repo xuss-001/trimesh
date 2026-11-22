@@ -417,6 +417,113 @@ class VoxelGridTest(g.unittest.TestCase):
         assert hash_ori != hash(vg._data)
         assert g.np.allclose(vg.scale, scale)
 
+    def test_resample(self):
+        np = g.np
+        tr = g.trimesh.transformations
+        SparseBinaryEncoding = g.trimesh.voxel.encoding.SparseBinaryEncoding
+
+        def grid(indices, shape, matrix=None):
+            return g.trimesh.voxel.VoxelGrid(
+                SparseBinaryEncoding(np.asarray(indices, dtype=np.int64), shape),
+                transform=matrix,
+            )
+
+        # a thin wall one voxel thick should survive resampling
+        # onto a grid with voxels twice as large
+        wall = np.zeros((4, 4, 4), dtype=bool)
+        wall[0] = True
+        source = g.trimesh.voxel.VoxelGrid(wall)
+        coarse = source.resampled(
+            (2, 2, 2), tr.scale_and_translate([2.0, 2.0, 2.0], [0.0, 0.0, 0.0])
+        )
+        assert coarse.shape == (2, 2, 2)
+        expected = np.zeros((2, 2, 2), dtype=bool)
+        expected[0] = True
+        assert (coarse.matrix == expected).all()
+        # the source grid is left unchanged
+        assert source.shape == (4, 4, 4)
+        assert source.filled_count == 16
+        assert np.allclose(source.transform, np.eye(4))
+
+        # a voxel rotated 45 degrees about z should overlap its
+        # axis neighbors but not the diagonal target voxel
+        rotated = grid(
+            [[0, 0, 0]], (1, 1, 1), tr.rotation_matrix(np.pi / 4.0, [0.0, 0.0, 1.0])
+        )
+        out = rotated.resampled((2, 2, 1), np.eye(4))
+        assert out.filled_count == 3
+        assert out.matrix[0, 0, 0]
+        assert out.matrix[1, 0, 0]
+        assert out.matrix[0, 1, 0]
+        assert not out.matrix[1, 1, 0]
+
+        # non-uniform positive scaling on the source, including
+        # exact face contact along the y axis which must not count
+        scaled = grid(
+            [[0, 0, 0]],
+            (1, 1, 1),
+            tr.scale_and_translate([2.0, 1.0, 4.0], [2.0, 1.0, 3.0]),
+        )
+        out = scaled.resampled((4, 2, 6), np.eye(4))
+        assert out.filled_count == 3 * 1 * 5
+        assert out.matrix[1:4, 1, 1:6].all()
+        assert not out.matrix[:, 0].any()
+
+        # non-uniform scaling on the target as well
+        out = scaled.resampled(
+            (4, 2, 6), tr.scale_and_translate([1.0, 2.0, 0.5], [0.0, 0.0, 0.0])
+        )
+        # target voxels span x:[i-0.5, i+0.5], y:[2j-1, 2j+1],
+        # z:[k/2-0.25, k/2+0.25] against the source box
+        # x:[1, 3], y:[0.5, 1.5], z:[1, 5]
+        # x overlaps for i in {1, 2, 3}, y for j in {0, 1} and z
+        # for k in {2, 3, 4, 5} with anything beyond the grid ignored
+        assert out.filled_count == 3 * 2 * 4
+        assert out.matrix[1:4, :, 2:6].all()
+        assert not out.matrix[0].any()
+        assert not out.matrix[:, :, :2].any()
+
+        # pure face, edge or corner contact is not an overlap
+        single = grid([[0, 0, 0]], (1, 1, 1))
+        for shift in ([1.0, 0.0, 0.0], [1.0, 1.0, 1.0], [0.0, 0.0, 1.0]):
+            moved = single.resampled((2, 2, 2), tr.translation_matrix(shift))
+            assert moved.filled_count == 0
+            assert moved.shape == (2, 2, 2)
+        # a half-voxel shift does overlap with positive volume
+        moved = single.resampled((2, 2, 2), tr.translation_matrix([0.5, 0.0, 0.0]))
+        assert moved.filled_count == 1
+
+        # an empty source resamples to an empty target
+        empty = g.trimesh.voxel.VoxelGrid(np.zeros((3, 3, 3), dtype=bool))
+        out = empty.resampled((5, 5, 5), np.eye(4))
+        assert out.is_empty
+        assert out.shape == (5, 5, 5)
+        assert np.allclose(out.transform, np.eye(4))
+
+        # source voxels outside the target grid are ignored
+        far = grid([[5, 5, 5]], (6, 6, 6))
+        assert far.resampled((2, 2, 2), np.eye(4)).is_empty
+
+        # invalid shapes raise
+        for bad in ((2, 2), (2, 2, -1), (2, 2, 0), (2.5, 2, 2), 3):
+            with self.assertRaises(ValueError):
+                single.resampled(bad, np.eye(4))
+
+        # unsupported transforms raise
+        shear = np.eye(4)
+        shear[0, 1] = 1.0
+        with self.assertRaises(ValueError):
+            single.resampled((2, 2, 2), shear)
+        # shear in the source transform also raises
+        with self.assertRaises(ValueError):
+            grid([[0, 0, 0]], (1, 1, 1), shear).resampled((2, 2, 2), np.eye(4))
+        # reflections are not positive scaling
+        with self.assertRaises(ValueError):
+            single.resampled((2, 2, 2), np.diag([-1.0, 1.0, 1.0, 1.0]))
+        # malformed transform matrices raise
+        with self.assertRaises(ValueError):
+            single.resampled((2, 2, 2), np.eye(3))
+
 
 if __name__ == "__main__":
     g.trimesh.util.attach_to_log()

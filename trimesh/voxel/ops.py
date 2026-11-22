@@ -1,8 +1,11 @@
+import operator
+
 import numpy as np
 
 from .. import util
 from ..constants import log
 from ..typed import ArrayLike, Number
+from .transforms import Transform
 
 
 def fill_orthographic(dense):
@@ -452,3 +455,115 @@ def points_to_indices(points, pitch=None, origin=None):
 
     indices = np.round(points).astype(int)
     return indices
+
+
+def resample(source_indices, source_matrix, target_matrix, target_shape):
+    """
+    Find the voxels of a target grid which conservatively overlap
+    occupied source voxels.
+
+    A target voxel is included only if it overlaps an occupied
+    source voxel with positive volume: contact along a face, edge
+    or corner alone does not count and anything outside the target
+    grid is ignored. Both transforms may feature translation,
+    rotation and non-uniform positive scaling.
+
+    Parameters
+    ----------
+    source_indices : (n, 3) int
+      Indices of occupied source voxels.
+    source_matrix : (4, 4) float
+      Homogeneous transform of the source grid.
+    target_matrix : (4, 4) float
+      Homogeneous transform of the target grid.
+    target_shape : (3,) int
+      Shape of the target grid.
+
+    Returns
+    ----------
+    indices : (m, 3) int
+      Sorted unique indices of occupied target voxels.
+
+    Raises
+    ----------
+    `ValueError`
+      If a transform features shear, reflection or non-positive
+      scaling, or the target shape is invalid.
+    """
+    # validate the shape without silently rounding floats
+    try:
+        shape = tuple(operator.index(s) for s in target_shape)
+    except TypeError:
+        raise ValueError(f"target_shape must be three positive ints: {target_shape!r}")
+    if len(shape) != 3 or any(s <= 0 for s in shape):
+        raise ValueError(f"target_shape must be three positive ints: {target_shape!r}")
+
+    # decompose both transforms, raising for unsupported matrices
+    source = Transform(source_matrix)
+    target = Transform(target_matrix)
+    rot_source, scale_source = source.rotation_scale
+    rot_target, scale_target = target.rotation_scale
+
+    source_indices = np.asanyarray(source_indices, dtype=np.int64).reshape((-1, 3))
+    if len(source_indices) == 0:
+        return np.zeros((0, 3), dtype=np.int64)
+
+    # source voxel axes expressed in the target frame: the columns
+    # are the rotated source axes with both scales applied
+    axes = rot_target.T.dot(rot_source) * scale_source / scale_target[:, None]
+    lengths = np.linalg.norm(axes, axis=0)
+    unit = axes / lengths
+    half = lengths / 2.0
+
+    # centers of the occupied source voxels in the target frame
+    offset = rot_target.T.dot(source.translation - target.translation) / scale_target
+    centers = source_indices.astype(np.float64).dot(axes.T) + offset
+
+    # half-width of a source box projected onto each target axis
+    radius = np.abs(axes).sum(axis=1) / 2.0
+
+    # candidate target voxels: anything within reach of a source box
+    lower = np.maximum(np.ceil(centers - radius - 0.5 - 1e-9).astype(np.int64), 0)
+    upper = np.minimum(
+        np.floor(centers + radius + 0.5 + 1e-9).astype(np.int64),
+        np.array(shape, dtype=np.int64) - 1,
+    )
+    spans = np.maximum(upper - lower + 1, 0)
+    counts = spans.prod(axis=1)
+    total = counts.sum()
+    if total == 0:
+        return np.zeros((0, 3), dtype=np.int64)
+
+    # enumerate every (source, candidate) pair without loops
+    which = np.repeat(np.arange(len(source_indices)), counts)
+    within = np.arange(total) - np.repeat(np.cumsum(counts) - counts, counts)
+    span = spans[which]
+    iz = within % span[:, 2]
+    iy = (within // span[:, 2]) % span[:, 1]
+    ix = within // (span[:, 2] * span[:, 1])
+    candidates = lower[which] + np.column_stack((ix, iy, iz))
+
+    # displacement between box centers for each pair
+    displacement = centers[which] - candidates
+
+    # separating axes: target axes, source axes and cross products
+    blocks = [np.eye(3), unit]
+    for i in range(3):
+        for j in range(3):
+            blocks.append(np.cross(np.eye(3)[i], unit[:, j]))
+    separating = np.vstack(blocks)
+    # drop degenerate axes from parallel source and target axes
+    separating = separating[np.linalg.norm(separating, axis=1) > 1e-12]
+
+    # boxes overlap with positive volume only if their projections
+    # strictly overlap on every separating axis
+    reach = (
+        np.abs(separating).sum(axis=1) / 2.0
+        + np.abs(separating.dot(unit)).dot(half)
+    )
+    distance = np.abs(displacement.dot(separating.T))
+    overlap = (distance < reach).all(axis=1)
+    occupied = candidates[overlap]
+    if len(occupied) == 0:
+        return np.zeros((0, 3), dtype=np.int64)
+    return np.unique(occupied, axis=0)

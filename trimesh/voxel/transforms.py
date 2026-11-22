@@ -116,6 +116,41 @@ class Transform:
         return scale
 
     @caching.cache_decorator
+    def rotation_scale(self):
+        """
+        Decompose into a rotation and a positive per-axis scale.
+
+        Returns
+        -------------
+        rotation : (3, 3) float
+          Orthonormal rotation matrix.
+        scale : (3,) float
+          Positive per-axis scale factors.
+
+        Raises
+        ------------
+        `ValueError`
+          If the transform features shear, reflection or
+          non-positive scaling.
+        """
+        matrix = self._data["transform_matrix"][:3, :3]
+        # a rotation combined with a positive diagonal scale
+        # results in a diagonal squared matrix holding scale ** 2
+        squared = matrix.T.dot(matrix)
+        scale = np.sqrt(np.clip(np.diag(squared), 0.0, None))
+        if not np.allclose(
+            squared,
+            np.diag(scale**2),
+            rtol=1e-6,
+            atol=np.max(scale**2) * 1e-6 + 1e-8,
+        ):
+            raise ValueError("transform features shear")
+        if np.linalg.det(matrix) <= 0.0:
+            raise ValueError("transform features reflection or zero scale")
+        rotation = matrix / scale
+        return rotation, scale
+
+    @caching.cache_decorator
     def unit_volume(self):
         """Volume of a transformed unit cube."""
         return np.linalg.det(self._data["transform_matrix"][:3, :3])

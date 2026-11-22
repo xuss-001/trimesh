@@ -16,7 +16,7 @@ from ..constants import log
 from ..exchange.binvox import export_binvox
 from ..parent import Geometry
 from . import morphology, ops, transforms
-from .encoding import DenseEncoding, Encoding
+from .encoding import DenseEncoding, Encoding, SparseBinaryEncoding
 
 
 class VoxelGrid(Geometry):
@@ -422,6 +422,50 @@ class VoxelGrid(Geometry):
         scale = extents / np.asanyarray(shape)
         translate = bounds[0]
         return VoxelGrid(dense, transform=tr.scale_and_translate(scale, translate))
+
+    def resampled(self, shape, transform=None):
+        """
+        Conservatively resample onto a grid with a caller-specified
+        shape and transform, preserving thin structures.
+
+        A target voxel is marked occupied only if it overlaps an
+        occupied source voxel with positive volume: contact along a
+        face, edge or corner alone does not count and anything
+        outside the target grid is ignored. Both grids may feature
+        translation, rotation and non-uniform positive scaling;
+        unsupported transforms such as shear raise a `ValueError`.
+
+        The source encoding is processed sparsely without
+        densifying it and `self` is left unchanged.
+
+        Parameters
+        ----------
+        shape : (3,) int
+          Shape of the returned grid.
+        transform : None or (4, 4) float
+          Homogeneous transform of the returned grid following the
+          `VoxelGrid` convention: voxel indices map to voxel centers.
+
+        Returns
+        ----------
+        resampled : VoxelGrid
+          New grid with the given shape and transform.
+        """
+        if transform is None:
+            transform = np.eye(4)
+        # only consider occupied voxels of the sparse encoding
+        encoding = self.encoding
+        indices = encoding.sparse_indices
+        if not isinstance(encoding, DenseEncoding):
+            indices = indices[encoding.sparse_values != 0]
+        indices = ops.resample(
+            source_indices=indices,
+            source_matrix=self.transform,
+            target_matrix=transform,
+            target_shape=shape,
+        )
+        encoding = SparseBinaryEncoding(indices, shape)
+        return VoxelGrid(encoding, transform=transform)
 
     def __add__(self, other):
         raise NotImplementedError("TODO : implement voxel concatenation")
