@@ -258,6 +258,7 @@ def sweep_polygon(
     polygon: "Polygon",
     path: ArrayLike,
     angles: ArrayLike | None = None,
+    scale: ArrayLike | None = None,
     cap: bool = True,
     connect: bool = True,
     kwargs: dict | None = None,
@@ -281,6 +282,10 @@ def sweep_polygon(
     angles : (n,) float
       Optional rotation angle relative to prior vertex
       at each vertex.
+    scale : (n, 2) float
+      Optional positive scaling factors for the cross section
+      at each vertex, applied to the polygon's two coordinate
+      directions about its origin before any rotation.
     cap
       If an open path is passed apply a cap to both ends.
     connect
@@ -311,6 +316,20 @@ def sweep_polygon(
 
     # check to see if path is closed i.e. first and last vertex are the same
     closed = np.linalg.norm(path[0] - path[-1]) < tol.merge
+
+    if scale is not None:
+        scale = np.asanyarray(scale, dtype=np.float64)
+        if scale.shape != (len(path), 2):
+            raise ValueError(f"Scale must be (n, 2) matching path, got {scale.shape}!")
+        if not (scale > 0.0).all():
+            raise ValueError("Scale values must all be positive!")
+        if closed and connect and not np.allclose(scale[0], scale[-1]):
+            raise ValueError(
+                "Closed paths with `connect=True` require the first and "
+                "last scale values to be identical, otherwise the seam "
+                "between the first and last slice cannot connect!"
+            )
+
     # Extract 2D vertices and triangulation
     vertices_2D, faces_2D = triangulate_polygon(polygon, **triangulation)
 
@@ -400,10 +419,26 @@ def sweep_polygon(
             check = tf.transform_points([[0.0, 0.0, 1.0]], matrix, translate=False)[0]
             assert np.allclose(check, n)
 
-    # apply transforms to prebaked homogeneous coordinates
-    vertices_3D = np.concatenate(
-        [np.dot(vertices_tf, matrix.T) for matrix in transforms], axis=0
-    )[:, :3]
+    if scale is None:
+        # apply transforms to prebaked homogeneous coordinates
+        vertices_3D = np.concatenate(
+            [np.dot(vertices_tf, matrix.T) for matrix in transforms], axis=0
+        )[:, :3]
+    else:
+        # scale each slice's cross section about the polygon origin
+        # before the rotation and translation are applied
+        vertices_scaled = np.tile(vertices_tf, (len(transforms), 1))
+        vertices_scaled[:, :2] *= np.repeat(scale, len(vertices_tf), axis=0)
+        vertices_3D = np.concatenate(
+            [
+                np.dot(
+                    vertices_scaled[i * len(vertices_tf) : (i + 1) * len(vertices_tf)],
+                    matrix.T,
+                )
+                for i, matrix in enumerate(transforms)
+            ],
+            axis=0,
+        )[:, :3]
 
     # now construct the faces with one group of boundary faces per slice
     stride = len(unique)
