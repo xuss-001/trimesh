@@ -452,3 +452,126 @@ def points_to_indices(points, pitch=None, origin=None):
 
     indices = np.round(points).astype(int)
     return indices
+
+
+def _check_resample_transform(matrix):
+    """
+    Validate a transform for `resample_sparse`.
+
+    Only translation, rotation and positive (possibly non-uniform)
+    scaling are supported, as anything else doesn't map voxels
+    to boxes.
+
+    Parameters
+    ----------
+    matrix : None or (4, 4) float
+      Homogeneous transformation matrix, None means identity.
+
+    Returns
+    ----------
+    matrix : (4, 4) float
+      Validated homogeneous transformation matrix.
+    """
+    if matrix is None:
+        return np.eye(4)
+    matrix = np.asanyarray(matrix, dtype=np.float64)
+    if matrix.shape != (4, 4) or not np.allclose(matrix[3], [0.0, 0.0, 0.0, 1.0]):
+        raise ValueError("transform must be a (4, 4) homogeneous matrix")
+    linear = matrix[:3, :3]
+    scale = np.linalg.norm(linear, axis=0)
+    rotation = linear / scale
+    if not np.allclose(rotation.T.dot(rotation), np.eye(3), atol=1e-8):
+        raise ValueError("transform contains shear, which is not supported")
+    if np.linalg.det(rotation) <= 0.0:
+        raise ValueError("transform contains reflection, which is not supported")
+    return matrix
+
+
+def resample_sparse(sparse_indices, shape, in_transform=None, out_transform=None):
+    """
+    Conservatively resample occupied voxels onto a new grid.
+
+    A voxel of the target grid is marked occupied only if it overlaps
+    an occupied source voxel with positive volume, so thin structures
+    survive resampling to a coarser resolution. Voxels which only
+    touch at a boundary are not occupied and anything outside the
+    target grid is ignored.
+
+    Voxel centers and sizes follow the `VoxelGrid` convention: the
+    transform maps voxel indices to voxel centers and its scale is
+    the side length of a voxel. Transforms may contain translation,
+    rotation and positive (possibly non-uniform) scaling.
+
+    Parameters
+    ----------
+    sparse_indices : (n, 3) int
+      Indices of occupied voxels in the source grid.
+    shape : (3,) int
+      Shape of the target grid, all entries must be positive.
+    in_transform : None or (4, 4) float
+      Homogeneous transform of the source grid, None means identity.
+    out_transform : None or (4, 4) float
+      Homogeneous transform of the target grid, None means identity.
+
+    Returns
+    ----------
+    occupied : (m, 3) int
+      Indices of occupied voxels in the target grid.
+    """
+    sparse_indices = np.asanyarray(sparse_indices, dtype=np.int64)
+    if sparse_indices.shape != (len(sparse_indices), 3):
+        raise ValueError("sparse_indices must be shaped (n, 3)")
+    shape = np.asanyarray(shape, dtype=np.int64)
+    if shape.shape != (3,) or np.any(shape <= 0):
+        raise ValueError("shape must be three positive integers")
+
+    in_transform = _check_resample_transform(in_transform)
+    out_transform = _check_resample_transform(out_transform)
+
+    # matrix mapping source voxel indices into target index space
+    matrix = np.linalg.inv(out_transform).dot(in_transform)
+    linear = matrix[:3, :3]
+    offset = matrix[:3, 3]
+    # half-extent vectors of a source voxel in target index space
+    half = 0.5 * linear
+    # half-extents of the axis-aligned bounding box of a source voxel
+    radius = np.abs(half).sum(axis=1)
+
+    # separating axes for the overlap test between a target voxel
+    # (an axis-aligned unit cube) and a transformed source voxel:
+    # both sets of box axes and their pairwise cross products
+    source_axes = [half[:, i] for i in range(3)]
+    axes = list(np.eye(3)) + source_axes
+    axes.extend(np.cross(np.eye(3)[i], s) for i in range(3) for s in source_axes)
+    # drop degenerate axes and precompute the summed projection radii
+    axes = [a for a in axes if np.linalg.norm(a) > 1e-12]
+    limits = [np.abs(half.T.dot(a)).sum() + 0.5 * np.abs(a).sum() for a in axes]
+
+    occupied = []
+    for index in sparse_indices:
+        center = linear.dot(index) + offset
+        # candidate target voxels are clipped to the target grid
+        lo = np.maximum(np.floor(center - radius - 0.5).astype(np.int64), 0)
+        hi = np.minimum(np.ceil(center + radius + 0.5).astype(np.int64), shape - 1)
+        if np.any(lo > hi):
+            continue
+        candidates = np.stack(
+            np.meshgrid(
+                *(np.arange(lo[i], hi[i] + 1) for i in range(3)), indexing="ij"
+            ),
+            axis=-1,
+        ).reshape(-1, 3)
+        delta = candidates - center
+        # positive volume overlap requires overlap on every
+        # separating axis, so exact boundary contact is excluded
+        keep = np.ones(len(candidates), dtype=bool)
+        for axis, limit in zip(axes, limits):
+            keep &= np.abs(delta.dot(axis)) < limit
+            if not keep.any():
+                break
+        if keep.any():
+            occupied.append(candidates[keep])
+
+    if len(occupied) == 0:
+        return np.zeros((0, 3), dtype=np.int64)
+    return np.unique(np.concatenate(occupied), axis=0)

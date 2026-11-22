@@ -16,7 +16,7 @@ from ..constants import log
 from ..exchange.binvox import export_binvox
 from ..parent import Geometry
 from . import morphology, ops, transforms
-from .encoding import DenseEncoding, Encoding
+from .encoding import DenseEncoding, Encoding, SparseBinaryEncoding
 
 
 class VoxelGrid(Geometry):
@@ -422,6 +422,43 @@ class VoxelGrid(Geometry):
         scale = extents / np.asanyarray(shape)
         translate = bounds[0]
         return VoxelGrid(dense, transform=tr.scale_and_translate(scale, translate))
+
+    def resample(self, shape, transform=None):
+        """
+        Conservatively resample this grid onto a target grid.
+
+        A voxel of the target grid is occupied only if it overlaps an
+        occupied voxel of this grid with positive volume, so thin
+        structures survive resampling to a different resolution.
+        Voxels which only touch at a boundary are not occupied and
+        anything outside the target grid is ignored.
+
+        The transforms of both grids may contain translation, rotation
+        and positive (possibly non-uniform) scaling; anything else
+        raises a `ValueError`. This grid is not mutated.
+
+        Parameters
+        ----------
+        shape : (3,) int
+          The shape of the returned VoxelGrid.
+        transform : None or (4, 4) float
+          Homogeneous transform of the returned VoxelGrid.
+          If None the current transform is re-used.
+
+        Returns
+        ----------
+        vox : VoxelGrid
+          The conservatively resampled grid.
+        """
+        if transform is None:
+            transform = self.transform
+        indices = ops.resample_sparse(
+            sparse_indices=self.sparse_indices,
+            shape=shape,
+            in_transform=self.transform,
+            out_transform=transform,
+        )
+        return VoxelGrid(SparseBinaryEncoding(indices, shape), transform=transform)
 
     def __add__(self, other):
         raise NotImplementedError("TODO : implement voxel concatenation")

@@ -418,6 +418,179 @@ class VoxelGridTest(g.unittest.TestCase):
         assert g.np.allclose(vg.scale, scale)
 
 
+class VoxelResampleTest(g.unittest.TestCase):
+    def test_identity(self):
+        # resampling onto the same grid preserves occupancy
+        matrix = g.np.random.RandomState(0).randint(0, 2, size=(4, 5, 6)).astype(bool)
+        grid = g.trimesh.voxel.VoxelGrid(matrix)
+        resampled = grid.resample(matrix.shape)
+        assert resampled.shape == matrix.shape
+        assert g.np.all(resampled.matrix == matrix)
+
+    def test_thin_wall(self):
+        # a one-voxel-thick wall offset from the coarse sampling points
+        dense = g.np.zeros((8, 8, 2), dtype=bool)
+        dense[:, :, 1] = True
+        wall = g.trimesh.voxel.VoxelGrid(dense)
+
+        # point sampling at the coarse grid centers misses the wall
+        assert wall.revoxelized((2, 2, 1)).is_empty
+
+        # conservative resampling keeps the wall
+        transform = g.np.diag([4.0, 4.0, 4.0, 1.0])
+        resampled = wall.resample((2, 2, 1), transform)
+        assert resampled.shape == (2, 2, 1)
+        assert resampled.filled_count == 4
+        assert g.np.all(resampled.matrix)
+
+    def test_rotation(self):
+        # an exact 90 degree rotation about z maps x to y
+        rotation = g.np.array(
+            [
+                [0.0, -1.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ]
+        )
+        indices = g.np.array([[0, 0, 0], [1, 0, 0], [2, 0, 0]])
+        source = g.trimesh.voxel.VoxelGrid(
+            g.trimesh.voxel.encoding.SparseBinaryEncoding(indices, (3, 1, 1)),
+            transform=rotation,
+        )
+        resampled = source.resample((2, 4, 1), g.np.eye(4))
+        expected = g.np.zeros((2, 4, 1), dtype=bool)
+        expected[0, :3, 0] = True
+        assert g.np.all(resampled.matrix == expected)
+
+        # a cube rotated 45 degrees about z overlaps the voxels
+        # sharing its faces but not the diagonal ones
+        rotation45 = g.trimesh.transformations.rotation_matrix(g.np.pi / 4, [0, 0, 1])
+        source = g.trimesh.voxel.VoxelGrid(
+            g.trimesh.voxel.encoding.SparseBinaryEncoding(
+                g.np.array([[0, 0, 0]]), (1, 1, 1)
+            ),
+            transform=rotation45,
+        )
+        resampled = source.resample((3, 3, 1), g.np.eye(4))
+        expected = g.np.zeros((3, 3, 1), dtype=bool)
+        expected[0, 0, 0] = True
+        expected[1, 0, 0] = True
+        expected[0, 1, 0] = True
+        assert g.np.all(resampled.matrix == expected)
+
+    def test_nonuniform_scale(self):
+        # source with non-uniform scale and translation:
+        # the voxel spans x in [0, 2]
+        transform = g.np.diag([2.0, 1.0, 1.0, 1.0])
+        transform[:3, 3] = [1.0, 0.0, 0.0]
+        source = g.trimesh.voxel.VoxelGrid(
+            g.np.ones((1, 1, 1), dtype=bool), transform=transform
+        )
+        # the first three target voxels overlap x in [0, 2]
+        resampled = source.resample((4, 1, 1), g.np.eye(4))
+        assert g.np.all(resampled.matrix[:, 0, 0] == [True, True, True, False])
+
+        # target with non-uniform scale
+        source = g.trimesh.voxel.VoxelGrid(
+            g.trimesh.voxel.encoding.SparseBinaryEncoding(
+                g.np.array([[2, 0, 0]]), (3, 1, 1)
+            )
+        )
+        transform = g.np.diag([0.25, 1.0, 1.0, 1.0])
+        resampled = source.resample((12, 1, 1), transform)
+        occupied = set(map(tuple, resampled.sparse_indices))
+        assert occupied == {(i, 0, 0) for i in range(6, 11)}
+
+    def test_boundary_contact(self):
+        source = g.trimesh.voxel.VoxelGrid(g.np.ones((1, 1, 1), dtype=bool))
+
+        # neighbors only touch at faces, edges and corners
+        resampled = source.resample((2, 2, 2))
+        assert resampled.filled_count == 1
+        assert resampled.matrix[0, 0, 0]
+
+        # a target translated to exactly touch the source voxel
+        transform = g.np.eye(4)
+        transform[0, 3] = 1.0
+        assert source.resample((2, 2, 2), transform).is_empty
+
+        # a slightly smaller translation overlaps with positive volume
+        transform[0, 3] = 0.75
+        resampled = source.resample((2, 2, 2), transform)
+        assert resampled.filled_count == 1
+        assert resampled.matrix[0, 0, 0]
+
+    def test_out_of_bounds(self):
+        # source voxels outside of the target grid are ignored
+        ops = g.trimesh.voxel.ops
+        indices = g.np.array([[-2, 0, 0], [0, 0, 0], [5, 0, 0]])
+        occupied = ops.resample_sparse(indices, (2, 1, 1))
+        assert occupied.shape == (1, 3)
+        assert tuple(occupied[0]) == (0, 0, 0)
+
+    def test_empty(self):
+        ops = g.trimesh.voxel.ops
+        empty = g.np.zeros((0, 3), dtype=g.np.int64)
+        occupied = ops.resample_sparse(empty, (2, 2, 2))
+        assert occupied.shape == (0, 3)
+
+        grid = g.trimesh.voxel.VoxelGrid(g.np.zeros((3, 3, 3), dtype=bool))
+        resampled = grid.resample((2, 2, 2))
+        assert resampled.is_empty
+        assert resampled.shape == (2, 2, 2)
+        assert resampled.filled_count == 0
+
+    def test_invalid(self):
+        ops = g.trimesh.voxel.ops
+        indices = g.np.array([[0, 0, 0]])
+
+        # invalid shapes
+        for shape in [(3, 3), (3, 3, 0), (3, 3, -1), (3, 3, 3, 3)]:
+            with self.assertRaises(ValueError):
+                ops.resample_sparse(indices, shape)
+
+        # invalid indices
+        with self.assertRaises(ValueError):
+            ops.resample_sparse(g.np.zeros((2, 2), dtype=g.np.int64), (3, 3, 3))
+
+        # shear is not supported in either transform
+        shear = g.np.eye(4)
+        shear[0, 1] = 0.5
+        with self.assertRaises(ValueError):
+            ops.resample_sparse(indices, (3, 3, 3), in_transform=shear)
+        with self.assertRaises(ValueError):
+            ops.resample_sparse(indices, (3, 3, 3), out_transform=shear)
+
+        # reflection is not supported
+        reflection = g.np.diag([-1.0, 1.0, 1.0, 1.0])
+        with self.assertRaises(ValueError):
+            ops.resample_sparse(indices, (3, 3, 3), in_transform=reflection)
+
+        # malformed transforms are not supported
+        with self.assertRaises(ValueError):
+            ops.resample_sparse(indices, (3, 3, 3), in_transform=g.np.eye(3))
+
+        grid = g.trimesh.voxel.VoxelGrid(g.np.ones((1, 1, 1), dtype=bool))
+        with self.assertRaises(ValueError):
+            grid.resample((3, 3, 3), transform=shear)
+
+    def test_sparse_source_untouched(self):
+        # a huge sparse grid is resampled without densifying it
+        encoding = g.trimesh.voxel.encoding.SparseBinaryEncoding(
+            g.np.array([[5000, 5000, 5000]]), shape=(10000, 10000, 10000)
+        )
+        source = g.trimesh.voxel.VoxelGrid(encoding)
+        transform = g.np.diag([10000.0, 10000.0, 10000.0, 1.0])
+        resampled = source.resample((1, 1, 1), transform)
+        assert resampled.filled_count == 1
+
+        # the source data is unchanged
+        assert source.shape == (10000, 10000, 10000)
+        assert g.np.all(source.sparse_indices == [[5000, 5000, 5000]])
+        assert g.np.allclose(source.transform, g.np.eye(4))
+
+
 if __name__ == "__main__":
     g.trimesh.util.attach_to_log()
     g.unittest.main()
